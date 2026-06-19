@@ -1,0 +1,9 @@
+.venv/
+.env
+*.sqlite
+*.db
+.snoo_token.txt
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store

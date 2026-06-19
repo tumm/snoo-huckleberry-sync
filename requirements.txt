@@ -1,0 +1,4 @@
+pysnoo2
+huckleberry-api
+aiohttp
+python-dotenv
