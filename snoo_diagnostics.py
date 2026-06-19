@@ -2,49 +2,55 @@
 """
 SNOO read-only diagnostic.
 
-Purpose: figure out which data source gives us individual sleep sessions with
-start/end times and (ideally) an asleep-vs-soothing breakdown, so we can pick
-the right architecture for the SNOO -> Huckleberry sync.
+Purpose: confirm which data source gives us individual sleep sessions with
+start/end times and an asleep-vs-soothing breakdown so we can lock the
+architecture for the SNOO -> Huckleberry sync.
 
 THIS SCRIPT IS READ-ONLY.
-  - It authenticates to the SNOO/Happiest Baby API with your credentials.
-  - It performs only HTTP GETs.
-  - It NEVER writes to SNOO and NEVER touches Huckleberry at all.
+  - Authenticates to SNOO via AWS Cognito (the current auth mechanism).
+  - Performs only HTTP GETs (REST probes + PubNub v2/history).
+  - NEVER writes to SNOO. NEVER touches Huckleberry.
+
+Note: pysnoo2 is broken — Happiest Baby migrated from OAuth (/us/v3/login)
+to AWS Cognito. This script uses 'python-snoo' (Lash-L) for auth.
 
 Usage:
-    pip install pysnoo2 --break-system-packages    # if not already installed
+    pip install -r requirements.txt
     export SNOO_USERNAME='you@example.com'
     export SNOO_PASSWORD='your-snoo-password'
-    python3 snoo_diagnostic.py
+    .venv/bin/python snoo_diagnostics.py
 
-Output is verbose and safe to paste back (it redacts your token and IDs by
-default; pass --no-redact if you're comfortable sharing raw).
+Output is redacted by default (safe to paste). Pass --no-redact for raw.
 """
 
 import argparse
 import asyncio
 import json
 import os
+import secrets
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 
 try:
     import aiohttp
-    import pysnoo2
-    from pysnoo2 import Snoo, SnooAuthSession, SnooPubNub
-    from pysnoo2.models import SessionLevel
-    from pysnoo2.const import SNOO_API_URI
+    import python_snoo
+    from python_snoo.snoo import Snoo
+    from python_snoo.containers import SnooData, SnooStates
 except ImportError as e:
     print(f"Missing dependency: {e}\nRun: pip install -r requirements.txt")
     sys.exit(1)
 
+SNOO_API_URI = "https://api-us-east-1-prod.happiestbaby.com"
+PUBNUB_SUB_KEY = "sub-c-97bade2a-483d-11e6-8b3b-02ee2ddab7fe"
+PUBNUB_ORIGIN = "happiestbaby.pubnubapi.com"
 
 REDACT = True
 
 
-def redact(value: str) -> str:
+def redact(value) -> str:
     if not REDACT or not value:
-        return value
+        return str(value) if value else ""
     s = str(value)
     if len(s) <= 6:
         return "***"
@@ -52,14 +58,15 @@ def redact(value: str) -> str:
 
 
 def jdump(obj) -> str:
-    """Pretty-print JSON, redacting obvious token/id fields."""
     def _scrub(o):
         if isinstance(o, dict):
             out = {}
             for k, v in o.items():
                 if REDACT and k.lower() in {
                     "token", "access_token", "refresh_token", "id_token",
+                    "accesstoken", "idtoken", "refreshtoken",
                     "email", "userid", "user_id", "babyid", "baby_id",
+                    "auth", "authorization",
                 }:
                     out[k] = redact(str(v))
                 else:
@@ -77,14 +84,15 @@ def banner(title: str):
     print("=" * 70)
 
 
-async def probe_get(session: SnooAuthSession, label: str, url: str, params: dict | None = None):
+async def probe_get(session: aiohttp.ClientSession, label: str, url: str,
+                    headers: dict, params: dict | None = None):
     """Perform a read-only GET and report status + body shape."""
     print(f"\n--- PROBE: {label}")
     print(f"    GET {url}")
     if params:
         print(f"    params: {params}")
     try:
-        async with await session.get(url, params=params or {}) as resp:
+        async with session.get(url, headers=headers, params=params or {}) as resp:
             status = resp.status
             print(f"    status: {status}")
             if status != 200:
@@ -97,14 +105,14 @@ async def probe_get(session: SnooAuthSession, label: str, url: str, params: dict
                 text = await resp.text()
                 print(f"    non-JSON body (first 500 chars): {text[:500]}")
                 return None
-            # Summarise shape
             if isinstance(data, dict):
                 print(f"    JSON object, top-level keys: {list(data.keys())}")
             elif isinstance(data, list):
                 print(f"    JSON array, length: {len(data)}")
                 if data:
+                    first = data[0]
                     print(f"    first element keys: "
-                          f"{list(data[0].keys()) if isinstance(data[0], dict) else type(data[0])}")
+                          f"{list(first.keys()) if isinstance(first, dict) else type(first)}")
             print("    BODY:")
             print("\n".join("    " + line for line in jdump(data).splitlines()[:80]))
             return data
@@ -113,11 +121,16 @@ async def probe_get(session: SnooAuthSession, label: str, url: str, params: dict
         return None
 
 
+def _event_time(snoo_data: SnooData) -> datetime:
+    """Convert event_time_ms (int) to UTC datetime."""
+    return datetime.utcfromtimestamp(snoo_data.event_time_ms / 1000).replace(
+        tzinfo=timezone.utc)
+
+
 async def main():
     global REDACT
     parser = argparse.ArgumentParser()
-    parser.add_argument("--no-redact", action="store_true",
-                        help="Do not redact IDs/tokens in output")
+    parser.add_argument("--no-redact", action="store_true")
     args = parser.parse_args()
     REDACT = not args.no_redact
 
@@ -128,226 +141,278 @@ async def main():
         sys.exit(1)
 
     print("SNOO read-only diagnostic")
-    print(f"pysnoo2 location: {pysnoo2.__file__}")
+    print(f"python-snoo location: {python_snoo.__file__}")
     print(f"API base: {SNOO_API_URI}")
     print(f"Redaction: {'ON (safe to paste)' if REDACT else 'OFF (raw)'}")
 
-    token_holder = {}
-
-    def token_updater(t):
-        token_holder["token"] = t
-
     async with aiohttp.ClientSession() as websession:
-        # pysnoo2's SnooAuthSession manages its own aiohttp internally via OAuth2Session;
-        # we construct it with credentials and let it fetch a token.
-        auth = SnooAuthSession(username=username, password=password,
-                               token_updater=token_updater)
+        snoo = Snoo(username, password, websession)
+
+        # ---- Auth via AWS Cognito ----
+        banner("STEP 1: Authenticate (AWS Cognito → Snoo token)")
+        auth_info = None
         try:
-            banner("STEP 1: Authenticate (read-only token fetch)")
-            token = await auth.fetch_token()
-            token_updater(token)
-            print("    Auth OK. Token acquired (value hidden).")
+            auth_info = await snoo.authorize()
+            print("    Auth OK.")
+            print(f"    aws_id (IdToken):    {redact(str(getattr(auth_info, 'aws_id', '')))}")
+            print(f"    aws_access:          {redact(str(getattr(auth_info, 'aws_access', '')))}")
+            print(f"    snoo (PubNub token): {redact(str(getattr(auth_info, 'snoo', '')))}")
         except Exception as e:
             print(f"    AUTH FAILED: {type(e).__name__}: {e}")
             print("    Check SNOO_USERNAME / SNOO_PASSWORD. Nothing was written.")
-            await auth.close()
             return
 
-        snoo = Snoo(auth)
+        id_token = getattr(auth_info, "aws_id", None)
+        snoo_token = getattr(auth_info, "snoo", None)
+        if not id_token:
+            print("    Could not extract IdToken from auth_info — inspect auth_info attrs:")
+            print(f"    {[a for a in dir(auth_info) if not a.startswith('_')]}")
+            return
 
-        # ---- Identify baby ----
+        rest_headers = {
+            "Authorization": f"Bearer {id_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "okhttp/4.7.2",
+        }
+
+        # ---- Devices + baby ----
+        banner("STEP 2: Devices & baby")
+        device_id = None
         baby_id = None
         try:
-            banner("STEP 2: Devices & baby")
             devices = await snoo.get_devices()
             print(f"    devices found: {len(devices)}")
-            baby = await snoo.get_baby()
-            baby_id = getattr(baby, "baby", None) or getattr(baby, "id", None)
-            # Baby model may store id under different attr; dump what we can
-            print(f"    baby object attrs: "
-                  f"{[a for a in dir(baby) if not a.startswith('_')][:20]}")
-            print(f"    resolved baby_id: {redact(baby_id) if baby_id else 'UNKNOWN'}")
+            if devices:
+                d = devices[0]
+                print(f"    device attrs: {[a for a in dir(d) if not a.startswith('_')]}")
+                # python-snoo uses serialNumber (camelCase via Mashumaro alias or snake_case)
+                device_id = (getattr(d, "serial_number", None)
+                             or getattr(d, "serialNumber", None)
+                             or getattr(d, "device_id", None))
+                print(f"    device_id/serial: {redact(device_id)}")
         except Exception as e:
-            print(f"    ERROR identifying baby: {type(e).__name__}: {e}")
+            print(f"    ERROR getting devices: {type(e).__name__}: {e}")
 
-        if not baby_id:
-            print("\n    Could not resolve baby_id; remaining probes need it. "
-                  "Paste output above and we'll adjust.")
-            await auth.close()
-            return
-
-        # ---- Exposed method: last session (Path A baseline) ----
         try:
-            banner("STEP 3: get_last_session (Path A baseline)")
-            last = await snoo.get_last_session(baby_id)
-            print(f"    start_time: {last.start_time}")
-            print(f"    end_time:   {last.end_time}")
-            print(f"    levels (count): {len(last.levels)}")
-            print(f"    levels: {[l.value for l in last.levels][:30]}")
-            print(f"    current_status: {last.current_status}")
+            babies = await snoo.get_babies()
+            print(f"    babies found: {len(babies)}")
+            if babies:
+                b = babies[0]
+                print(f"    baby attrs: {[a for a in dir(b) if not a.startswith('__')]}")
+                baby_id = (getattr(b, "_id", None)
+                           or getattr(b, "baby_id", None)
+                           or getattr(b, "uid", None)
+                           or getattr(b, "id", None))
+                print(f"    baby_id: {redact(baby_id)}")
         except Exception as e:
-            print(f"    ERROR: {type(e).__name__}: {e}")
+            print(f"    ERROR getting babies: {type(e).__name__}: {e}")
 
-        # ---- Exposed method: aggregated avg (daily totals only) ----
-        try:
-            banner("STEP 4: get_aggregated_session_avg (daily totals)")
-            from pysnoo2.models import AggregatedSessionInterval
-            start = datetime.now() - timedelta(days=2)
-            agg = await snoo.get_aggregated_session_avg(
-                baby_id, start_time=start,
-                interval=AggregatedSessionInterval.WEEK, days=True)
-            print(f"    total_sleep_avg:   {agg.total_sleep_avg}")
-            print(f"    day_sleep_avg:     {agg.day_sleep_avg}")
-            print(f"    night_sleep_avg:   {agg.night_sleep_avg}")
-            print(f"    longest_sleep_avg: {agg.longest_sleep_avg}")
-            print(f"    has per-day 'days' block: {agg.days is not None}")
-        except Exception as e:
-            print(f"    ERROR: {type(e).__name__}: {e}")
+        # ---- Path A: last session ----
+        banner("STEP 3: get_last_session (Path A baseline)")
+        if baby_id:
+            url = f"{SNOO_API_URI}/ss/me/v10/babies/{baby_id}/sessions/last"
+            data = await probe_get(websession, "last session", url, rest_headers)
+            if data:
+                print(f"    startTime: {data.get('startTime')}")
+                print(f"    endTime:   {data.get('endTime')}")
+                levels = data.get("levels", [])
+                print(f"    levels (count): {len(levels)}")
+                print(f"    first few levels: {levels[:5]}")
+        else:
+            print("    Skipped — no baby_id resolved.")
 
-        # ---- PROBES: hunt for per-segment session timeline (Paths B/C) ----
-        banner("STEP 5: Probe candidate endpoints for per-SESSION timeline")
-        print("These are read-only GETs hunting for a list of individual sessions")
-        print("with start/end + asleep/soothing breakdown. 404/403 is fine — it just")
-        print("means that endpoint shape isn't available on your account.")
+        # ---- Path A: aggregated avg ----
+        banner("STEP 4: aggregated session avg (daily totals only)")
+        if baby_id:
+            start_2d = (datetime.now(timezone.utc) - timedelta(days=2)).strftime(
+                "%Y-%m-%d %H:%M:%S.%f")[:-3]
+            url = f"{SNOO_API_URI}/ss/v2/babies/{baby_id}/sessions/aggregated/avg/"
+            data = await probe_get(websession, "aggregated/avg", url, rest_headers,
+                                   {"startTime": start_2d, "interval": "week", "days": "true"})
+        else:
+            print("    Skipped — no baby_id resolved.")
 
-        now = datetime.now(timezone.utc)
-        start_24h = now - timedelta(hours=24)
-        start_48h = now - timedelta(hours=48)
-
-        # Common datetime formats the API might expect
-        fmt_micro = "%Y-%m-%d %H:%M:%S.%f"
-        fmt_iso = "%Y-%m-%dT%H:%M:%S.000Z"
-
-        base = SNOO_API_URI
-        b = baby_id
-
-        candidates = [
-            # (label, url, params)
-            ("aggregated (no /avg) micro-fmt",
-             f"{base}/ss/v2/babies/{b}/sessions/aggregated/",
-             {"startTime": start_24h.strftime(fmt_micro)[:-3]}),
-            ("aggregated (no /avg) with days",
-             f"{base}/ss/v2/babies/{b}/sessions/aggregated/",
-             {"startTime": start_24h.strftime(fmt_micro)[:-3], "days": "true"}),
-            ("sessions list (v2) start+end iso",
-             f"{base}/ss/v2/babies/{b}/sessions/",
-             {"startTime": start_24h.strftime(fmt_iso), "endTime": now.strftime(fmt_iso)}),
-            ("sessions list (v10) start+end iso",
-             f"{base}/ss/me/v10/babies/{b}/sessions/",
-             {"startTime": start_24h.strftime(fmt_iso), "endTime": now.strftime(fmt_iso)}),
-            ("sessions list (v2) micro-fmt",
-             f"{base}/ss/v2/babies/{b}/sessions/",
-             {"startTime": start_48h.strftime(fmt_micro)[:-3]}),
-            ("sessions/aggregated/avg WITHOUT avg suffix variant",
-             f"{base}/ss/v2/babies/{b}/sessions/aggregated",
-             {"startTime": start_24h.strftime(fmt_micro)[:-3], "interval": "week", "days": "true"}),
-            ("daily sessions",
-             f"{base}/ss/v2/babies/{b}/sessions/daily/",
-             {"startTime": start_24h.strftime(fmt_iso), "endTime": now.strftime(fmt_iso)}),
-        ]
-
+        # ---- Path B: probe for per-segment data-API timeline ----
+        banner("STEP 5: Probe candidate endpoints for per-session timeline (Path B)")
+        print("GETs only — 404/403 expected for missing endpoints.")
         found_timeline = False
-        for label, url, params in candidates:
-            data = await probe_get(auth, label, url, params)
-            # Heuristic: does the payload contain per-segment items with a 'type'
-            # of asleep/soothing/awake and individual startTimes?
-            if data and isinstance(data, dict):
-                blob = json.dumps(data).lower()
-                if '"asleep"' in blob or '"soothing"' in blob or "sessionid" in blob:
-                    print("    >>> This endpoint appears to contain per-segment "
-                          "session data (asleep/soothing/sessionId). PROMISING.")
-                    found_timeline = True
+        if baby_id:
+            now = datetime.now(timezone.utc)
+            s24 = now - timedelta(hours=24)
+            s48 = now - timedelta(hours=48)
+            fmt_micro = "%Y-%m-%d %H:%M:%S.%f"
+            fmt_iso = "%Y-%m-%dT%H:%M:%S.000Z"
+            b = baby_id
+            base = SNOO_API_URI
 
-        # ---- PATH C: PubNub ActivityState history ----
-        try:
-            banner("STEP 6: PubNub Path C — ActivityState history (100 events)")
-            print("This is READ-ONLY. We subscribe to no live channel; history() is a REST call.")
-            devices = await snoo.get_devices()
-            if not devices:
-                print("    No devices found — cannot build PubNub channel.")
-            else:
-                serial = devices[0].serial_number
-                print(f"    Device serial: {redact(serial)}")
-                pubnub_token = await snoo.pubnub_auth()
-                pubnub = SnooPubNub(
-                    pubnub_token,
-                    snoo.pubnub_auth,
-                    serial,
-                    f"pn-pysnoo-diag-{serial}",
+            candidates = [
+                ("aggregated (no /avg) micro-fmt",
+                 f"{base}/ss/v2/babies/{b}/sessions/aggregated/",
+                 {"startTime": s24.strftime(fmt_micro)[:-3]}),
+                ("aggregated (no /avg) with days",
+                 f"{base}/ss/v2/babies/{b}/sessions/aggregated/",
+                 {"startTime": s24.strftime(fmt_micro)[:-3], "days": "true"}),
+                ("sessions list (v2) iso",
+                 f"{base}/ss/v2/babies/{b}/sessions/",
+                 {"startTime": s24.strftime(fmt_iso), "endTime": now.strftime(fmt_iso)}),
+                ("sessions list (v10) iso",
+                 f"{base}/ss/me/v10/babies/{b}/sessions/",
+                 {"startTime": s24.strftime(fmt_iso), "endTime": now.strftime(fmt_iso)}),
+                ("sessions list (v2) micro-fmt",
+                 f"{base}/ss/v2/babies/{b}/sessions/",
+                 {"startTime": s48.strftime(fmt_micro)[:-3]}),
+                ("daily sessions",
+                 f"{base}/ss/v2/babies/{b}/sessions/daily/",
+                 {"startTime": s24.strftime(fmt_iso), "endTime": now.strftime(fmt_iso)}),
+            ]
+            for label, url, params in candidates:
+                data = await probe_get(websession, label, url, rest_headers, params)
+                if data:
+                    blob = json.dumps(data).lower()
+                    if '"asleep"' in blob or '"soothing"' in blob or "sessionid" in blob:
+                        print("    >>> PROMISING: endpoint appears to have per-segment data.")
+                        found_timeline = True
+        else:
+            print("    Skipped — no baby_id resolved.")
+
+        # ---- Path C: PubNub v2/history ----
+        banner("STEP 6: PubNub Path C — ActivityState history (100 events)")
+        print("READ-ONLY REST call to PubNub v2/history — no live subscription.")
+        if not device_id:
+            print("    Skipped — no device_id resolved.")
+        elif not snoo_token:
+            print("    Skipped — no snoo PubNub token in auth_info.")
+        else:
+            try:
+                req_uuid = uuid.uuid1()
+                dev_uuid = uuid.uuid1()
+                app_dev_id = secrets.token_urlsafe(18)
+                channel = f"ActivityState.{device_id}"
+                pub_url = (
+                    f"https://{PUBNUB_ORIGIN}/v2/history"
+                    f"/sub-key/{PUBNUB_SUB_KEY}"
+                    f"/channel/{channel}"
+                    f"?pnsdk=PubNub-Kotlin%2F7.4.0"
+                    f"&auth={snoo_token}"
+                    f"&requestid={req_uuid}"
+                    f"&include_token=true"
+                    f"&count=100"
+                    f"&include_meta=false"
+                    f"&reverse=false"
+                    f"&uuid=android_{app_dev_id}_{dev_uuid}"
                 )
-                try:
-                    events = await pubnub.history(100)
-                    print(f"    Retrieved {len(events)} ActivityState events.")
-                    if not events:
-                        print("    No events returned — SNOO may not have been used recently.")
+                print(f"    Channel: ActivityState.{redact(device_id)}")
+                async with websession.get(pub_url) as resp:
+                    status = resp.status
+                    print(f"    PubNub history status: {status}")
+                    if status != 200:
+                        body = await resp.text()
+                        print(f"    Error body: {body[:400]}")
                     else:
-                        # Sort oldest-first so the timeline reads naturally
-                        events_sorted = sorted(events, key=lambda e: e.event_time)
-                        now_utc = datetime.now(timezone.utc)
-                        lookback = now_utc - timedelta(hours=6)
+                        raw = await resp.json()
+                        # PubNub v2 history with include_token=true:
+                        # [[{"message": {...}, "timetoken": "..."}, ...], start_tt, end_tt]
+                        # Without include_token: [[msg1, msg2, ...], start_tt, end_tt]
+                        if not isinstance(raw, list) or len(raw) < 1:
+                            print(f"    Unexpected response shape: {type(raw)}")
+                        else:
+                            messages_raw = raw[0]
+                            print(f"    Retrieved {len(messages_raw)} raw messages.")
 
-                        distinct_levels = set()
-                        session_ids = set()
+                            events = []
+                            parse_errors = 0
+                            for item in messages_raw:
+                                try:
+                                    if isinstance(item, dict) and "message" in item:
+                                        msg_dict = item["message"]
+                                        tt = item.get("timetoken")
+                                    else:
+                                        msg_dict = item
+                                        tt = None
+                                    if isinstance(msg_dict, dict) and "system_state" in msg_dict:
+                                        sd = SnooData.from_dict(msg_dict)
+                                        events.append((sd, tt))
+                                    else:
+                                        print(f"    Skipping non-ActivityState message "
+                                              f"(keys: {list(msg_dict.keys()) if isinstance(msg_dict, dict) else type(msg_dict)})")
+                                except Exception as ex:
+                                    parse_errors += 1
+                                    if parse_errors <= 3:
+                                        print(f"    Parse error on message: {ex}")
 
-                        print(f"\n    Full timeline (oldest → newest):")
-                        print(f"    {'event_time (UTC)':<28} {'state':<20} {'active':>6}  session_id")
-                        print(f"    {'-'*28} {'-'*20} {'-'*6}  {'-'*12}")
-                        for ev in events_sorted:
-                            sm = ev.state_machine
-                            distinct_levels.add(sm.state)
-                            if sm.session_id:
-                                session_ids.add(sm.session_id)
-                            age_marker = " ← in 6h window" if ev.event_time >= lookback else ""
-                            sid_display = redact(sm.session_id) if sm.session_id else "—"
-                            print(f"    {str(ev.event_time):<28} {sm.state.value:<20} "
-                                  f"{'yes' if sm.is_active_session else 'no':>6}  "
-                                  f"{sid_display}{age_marker}")
+                            if parse_errors:
+                                print(f"    Total parse errors: {parse_errors}")
 
-                        print(f"\n    Distinct SessionLevel values seen: "
-                              f"{sorted(l.value for l in distinct_levels)}")
-                        print(f"    Distinct session_ids seen: {len(session_ids)}")
+                            if not events:
+                                print("    No SnooData events parsed — SNOO may not have been used recently.")
+                                print("    (Try running again after a session.)")
+                            else:
+                                events_sorted = sorted(events, key=lambda t: _event_time(t[0]))
+                                now_utc = datetime.now(timezone.utc)
+                                lookback = now_utc - timedelta(hours=6)
 
-                        in_window = [e for e in events_sorted if e.event_time >= lookback]
-                        print(f"\n    Events within 6-hour lookback window: {len(in_window)}")
-                        if len(in_window) < len(events_sorted):
-                            oldest_in_window = min((e.event_time for e in in_window), default=None)
-                            print(f"    Oldest event in window: {oldest_in_window}")
-                            print(f"    NOTE: if 100 events don't cover 6 hours, we'll need")
-                            print(f"    timetoken-based pagination for the full window.")
+                                distinct_states: set[str] = set()
+                                session_ids: set = set()
 
-                        # Proposed mapping for confirmation:
-                        asleep_levels = {SessionLevel.BASELINE, SessionLevel.WEANING_BASELINE}
-                        soothing_levels = {SessionLevel.LEVEL1, SessionLevel.LEVEL2,
-                                           SessionLevel.LEVEL3, SessionLevel.LEVEL4}
-                        inactive_levels = {SessionLevel.ONLINE, SessionLevel.NONE,
-                                           SessionLevel.PRETIMEOUT, SessionLevel.TIMEOUT}
-                        print(f"\n    Proposed level mapping (lock after reviewing above):")
-                        print(f"      ASLEEP   : {sorted(l.value for l in asleep_levels & distinct_levels)}")
-                        print(f"      SOOTHING : {sorted(l.value for l in soothing_levels & distinct_levels)}")
-                        print(f"      AWAKE    : {sorted(l.value for l in inactive_levels & distinct_levels)}")
-                        unseen_map = distinct_levels - asleep_levels - soothing_levels - inactive_levels
-                        if unseen_map:
-                            print(f"      UNMAPPED : {sorted(l.value for l in unseen_map)} ← needs decision")
-                finally:
-                    await pubnub.stop()
-        except Exception as e:
-            print(f"    ERROR in PubNub Path C: {type(e).__name__}: {e}")
+                                print(f"\n    Full timeline (oldest → newest):")
+                                print(f"    {'event_time (UTC)':<28} {'state':<20} "
+                                      f"{'active':>6}  session_id")
+                                print(f"    {'-'*28} {'-'*20} {'-'*6}  {'-'*12}")
+                                for sd, _tt in events_sorted:
+                                    sm = sd.state_machine
+                                    state_val = sm.state.value if hasattr(sm.state, 'value') else str(sm.state)
+                                    distinct_states.add(state_val)
+                                    sid = getattr(sm, "session_id", None)
+                                    if sid:
+                                        session_ids.add(sid)
+                                    t = _event_time(sd)
+                                    marker = " ← in 6h window" if t >= lookback else ""
+                                    sid_display = redact(sid) if sid else "—"
+                                    active = getattr(sm, "is_active_session", "?")
+                                    print(f"    {str(t):<28} {state_val:<20} "
+                                          f"{'yes' if active else 'no':>6}  {sid_display}{marker}")
+
+                                print(f"\n    Distinct state values seen: {sorted(distinct_states)}")
+                                print(f"    Distinct session_ids seen: {len(session_ids)}")
+
+                                in_window = [(sd, tt) for sd, tt in events_sorted
+                                             if _event_time(sd) >= lookback]
+                                print(f"\n    Events within 6-hour lookback window: {len(in_window)}")
+                                if len(in_window) < len(events_sorted):
+                                    print(f"    NOTE: 100 events cover less than 6 hours.")
+                                    print(f"    Timetoken pagination will be needed for full coverage.")
+
+                                # Proposed mapping:
+                                asleep_states = {"BASELINE", "WEANING_BASELINE", "baseline", "weaning_baseline"}
+                                soothing_states = {"LEVEL1", "LEVEL2", "LEVEL3", "LEVEL4",
+                                                   "level1", "level2", "level3", "level4"}
+                                inactive_states = {"ONLINE", "NONE", "PRETIMEOUT", "TIMEOUT",
+                                                   "stop", "none", "pretimeout", "timeout",
+                                                   "online", "suspended", "manual"}
+                                print(f"\n    Proposed level mapping (lock after reviewing above):")
+                                print(f"      ASLEEP   : {sorted(asleep_states & distinct_states)}")
+                                print(f"      SOOTHING : {sorted(soothing_states & distinct_states)}")
+                                print(f"      AWAKE    : {sorted(inactive_states & distinct_states)}")
+                                unmapped = distinct_states - asleep_states - soothing_states - inactive_states
+                                if unmapped:
+                                    print(f"      UNMAPPED : {sorted(unmapped)} ← needs decision")
+            except Exception as e:
+                print(f"    ERROR in PubNub Path C: {type(e).__name__}: {e}")
+                import traceback; traceback.print_exc()
 
         banner("FINAL SUMMARY")
-        print("Path A (get_last_session): single most-recent session only; no segment split.")
+        print("Path A (last session REST): single most-recent session only; no segment split.")
         print(f"Path B (data API /ss/): "
-              f"{'PROMISING endpoint found ✅ — see Step 5 above' if found_timeline else 'no per-segment endpoint found ❌'}")
+              f"{'PROMISING endpoint found ✅ — see Step 5' if found_timeline else 'no per-segment endpoint found ❌'}")
         print("Path C (PubNub history): see Step 6 above.")
         print()
         print("Decision guide:")
-        print("  If Step 5 found a PROMISING endpoint → Path B (data API) is viable.")
-        print("  If Step 6 returned events with asleep/soothing/awake transitions → Path C confirmed.")
-        print("  If Step 6 returned 0 events or <10 events → SNOO not used recently; try again after a session.")
+        print("  Step 5 PROMISING marker → Path B viable (data API has the timeline).")
+        print("  Step 6 events with asleep/soothing/awake states → Path C confirmed.")
+        print("  Step 6 = 0 events → SNOO not used recently; run again after a session.")
         print()
-        print("Paste this entire output back and we'll lock the architecture and level mapping.")
+        print("Paste this entire output back to lock the architecture and level mapping.")
         print("Reminder: this script wrote nothing, anywhere.")
-
-        await auth.close()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-pysnoo2
+python-snoo
 huckleberry-api
 aiohttp
 python-dotenv
