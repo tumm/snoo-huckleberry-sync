@@ -65,28 +65,37 @@ async def write_sleep_interval(
         duration_sec,
     )
 
-    # Update prefs.lastSleep only when this interval is newer than the stored one
-    now = time.time()
-    sleep_doc = await sleep_ref.get()
-    existing_last_start = 0.0
-    if sleep_doc.exists:
-        prefs = (sleep_doc.to_dict() or {}).get("prefs", {})
-        existing_last_start = float((prefs.get("lastSleep") or {}).get("start") or 0)
+    # Update prefs.lastSleep only when this interval is newer than the stored one.
+    # Best-effort: a failure here must not prevent the dedupe mark from running.
+    try:
+        now = time.time()
+        sleep_doc = await sleep_ref.get()
+        existing_last_start = 0.0
+        if sleep_doc.exists:
+            prefs = (sleep_doc.to_dict() or {}).get("prefs", {})
+            existing_last_start = float((prefs.get("lastSleep") or {}).get("start") or 0)
 
-    if start_sec > existing_last_start:
-        last_sleep = FirebaseLastSleepData(
-            start=start_sec,
-            duration=duration_sec,
-            offset=tz_offset,
-        )
-        await sleep_ref.update(
-            {
-                "prefs.lastSleep": to_firebase_dict(last_sleep),
-                "prefs.timestamp": {"seconds": now},
-                "prefs.local_timestamp": now,
-            }
-        )
-        log.debug("Updated prefs.lastSleep for child %s", child_uid)
+        if start_sec > existing_last_start:
+            last_sleep = FirebaseLastSleepData(
+                start=start_sec,
+                duration=duration_sec,
+                offset=tz_offset,
+            )
+            # set(..., merge=True) creates the parent document if it doesn't exist yet,
+            # unlike update() which requires it to already exist.
+            await sleep_ref.set(
+                {
+                    "prefs": {
+                        "lastSleep": to_firebase_dict(last_sleep),
+                        "timestamp": {"seconds": now},
+                        "local_timestamp": now,
+                    }
+                },
+                merge=True,
+            )
+            log.debug("Updated prefs.lastSleep for child %s", child_uid)
+    except Exception:
+        log.warning("Failed to update prefs.lastSleep -interval already written, continuing.", exc_info=True)
 
 
 async def make_huckleberry_client(

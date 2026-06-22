@@ -1,0 +1,13 @@
+services:
+  snoo-sync:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override the local dev path from .env with the container volume path
+      DB_PATH: /data/dedupe.sqlite
+    volumes:
+      - snoo_data:/data
+
+volumes:
+  snoo_data:

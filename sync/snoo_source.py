@@ -1,112 +1,88 @@
-"""SNOO data source: authenticate and fetch PubNub ActivityState history."""
+"""SNOO data source: poll /hds/me/v11/devices for current activity state."""
 
 import logging
-import secrets
-import uuid
-from datetime import datetime, timedelta, timezone
-from typing import List
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import aiohttp
 from python_snoo.snoo import Snoo
-from python_snoo.containers import SnooData
 
 log = logging.getLogger(__name__)
 
-PUBNUB_SUB_KEY = "sub-c-97bade2a-483d-11e6-8b3b-02ee2ddab7fe"
-PUBNUB_ORIGIN = "happiestbaby.pubnubapi.com"
-PUBNUB_HISTORY_COUNT = 100
+DEVICES_URL = "https://api-us-east-1-prod.happiestbaby.com/hds/me/v11/devices"
 
 
-def event_time(sd: SnooData) -> datetime:
-    return datetime.utcfromtimestamp(sd.event_time_ms / 1000).replace(tzinfo=timezone.utc)
+@dataclass
+class SnooDeviceState:
+    session_id: str
+    is_active: bool
+    event_time_ms: int  # timestamp of the most recent state change on the device
+    since_session_start_ms: int  # ms since session start; -1 when inactive
+
+    @property
+    def session_start_ms(self) -> int | None:
+        """Back-compute session start from device-reported elapsed time."""
+        if self.is_active and self.since_session_start_ms >= 0:
+            return self.event_time_ms - self.since_session_start_ms
+        return None
+
+    @property
+    def session_start(self) -> datetime | None:
+        ms = self.session_start_ms
+        if ms is None:
+            return None
+        return datetime.utcfromtimestamp(ms / 1000).replace(tzinfo=timezone.utc)
+
+    @property
+    def event_time(self) -> datetime:
+        return datetime.utcfromtimestamp(self.event_time_ms / 1000).replace(tzinfo=timezone.utc)
 
 
-async def fetch_events(
+async def fetch_device_state(
     websession: aiohttp.ClientSession,
     username: str,
     password: str,
-    lookback_hours: float,
-) -> List[SnooData]:
-    """Authenticate to SNOO and return ActivityState events within the lookback window."""
+) -> SnooDeviceState:
+    """Authenticate and return the current SNOO activity state."""
     snoo = Snoo(username, password, websession)
-    auth_info = await snoo.authorize()
+    await snoo.authorize()
+    hdrs = snoo.generate_snoo_auth_headers(snoo.tokens.aws_id)
 
-    snoo_token = getattr(auth_info, "snoo", None)
-    if not snoo_token:
-        raise RuntimeError("No PubNub snoo token in auth response")
+    async with websession.get(DEVICES_URL, headers=hdrs) as r:
+        r.raise_for_status()
+        data = await r.json()
 
-    devices = await snoo.get_devices()
+    devices = data.get("snoo", [])
     if not devices:
         raise RuntimeError("No SNOO devices found on this account")
 
-    serial = (
-        getattr(devices[0], "serialNumber", None)
-        or getattr(devices[0], "serial_number", None)
+    activity = devices[0].get("activityState", {})
+    sm = activity.get("state_machine", {})
+
+    # is_active_session comes back as the string "true"/"false", not a bool
+    is_active = str(sm.get("is_active_session", "false")).lower() == "true"
+    session_id = str(sm.get("session_id", "0"))
+    event_time_ms = int(activity.get("event_time_ms", 0))
+    since_start = int(sm.get("since_session_start_ms", -1))
+
+    state = SnooDeviceState(
+        session_id=session_id,
+        is_active=is_active,
+        event_time_ms=event_time_ms,
+        since_session_start_ms=since_start,
     )
-    if not serial:
-        raise RuntimeError("Could not resolve device serial number")
 
-    log.debug("Fetching PubNub history for channel ActivityState.%s", serial)
-    events = await _fetch_pubnub_history(websession, serial, snoo_token)
-
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    in_window = [e for e in events if event_time(e) >= cutoff]
+    # Cancel the background reauth task -our aiohttp session is short-lived
+    # and will be closed before the 175-min reauth window fires.
+    if snoo.reauth_task:
+        snoo.reauth_task.cancel()
+        snoo.reauth_task = None
 
     log.info(
-        "PubNub: fetched %d events, %d within %.0f-hour lookback window",
-        len(events),
-        len(in_window),
-        lookback_hours,
+        "Device state: is_active=%s  session_id=%s  event_time=%s  since_start=%ds",
+        is_active,
+        session_id,
+        state.event_time.isoformat(),
+        since_start // 1000 if since_start > 0 else -1,
     )
-    return sorted(in_window, key=event_time)
-
-
-async def _fetch_pubnub_history(
-    websession: aiohttp.ClientSession,
-    serial: str,
-    snoo_token: str,
-) -> List[SnooData]:
-    req_uuid = uuid.uuid1()
-    dev_uuid = uuid.uuid1()
-    app_dev_id = secrets.token_urlsafe(18)
-
-    url = (
-        f"https://{PUBNUB_ORIGIN}/v2/history"
-        f"/sub-key/{PUBNUB_SUB_KEY}"
-        f"/channel/ActivityState.{serial}"
-        f"?pnsdk=PubNub-Kotlin%2F7.4.0"
-        f"&auth={snoo_token}"
-        f"&requestid={req_uuid}"
-        f"&include_token=true"
-        f"&count={PUBNUB_HISTORY_COUNT}"
-        f"&include_meta=false"
-        f"&reverse=false"
-        f"&uuid=android_{app_dev_id}_{dev_uuid}"
-    )
-
-    async with websession.get(url) as resp:
-        resp.raise_for_status()
-        raw = await resp.json(content_type=None)
-
-    if not isinstance(raw, list) or not raw:
-        log.warning("Unexpected PubNub history response shape")
-        return []
-
-    messages_raw = raw[0]
-    events: List[SnooData] = []
-    for item in messages_raw:
-        try:
-            msg_dict = item["message"] if isinstance(item, dict) and "message" in item else item
-            if isinstance(msg_dict, dict) and "system_state" in msg_dict:
-                events.append(SnooData.from_dict(msg_dict))
-        except Exception:
-            log.debug("Failed to parse PubNub message: %r", item, exc_info=True)
-
-    if len(messages_raw) == PUBNUB_HISTORY_COUNT:
-        log.warning(
-            "Received full %d-event page from PubNub — history may extend further. "
-            "Consider adding timetoken pagination if lookback window is not fully covered.",
-            PUBNUB_HISTORY_COUNT,
-        )
-
-    return events
+    return state

@@ -1,4 +1,0 @@
-python-snoo
-huckleberry-api
-aiohttp
-python-dotenv
