@@ -31,11 +31,11 @@ class SnooDeviceState:
         ms = self.session_start_ms
         if ms is None:
             return None
-        return datetime.utcfromtimestamp(ms / 1000).replace(tzinfo=timezone.utc)
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
     @property
     def event_time(self) -> datetime:
-        return datetime.utcfromtimestamp(self.event_time_ms / 1000).replace(tzinfo=timezone.utc)
+        return datetime.fromtimestamp(self.event_time_ms / 1000, tz=timezone.utc)
 
 
 async def fetch_device_state(

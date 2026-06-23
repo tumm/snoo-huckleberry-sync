@@ -3,7 +3,6 @@
 import logging
 import time
 import uuid
-from datetime import datetime
 
 import aiohttp
 from huckleberry_api import HuckleberryAPI
@@ -58,7 +57,7 @@ async def write_sleep_interval(
         to_firebase_dict(sleep_data)
     )
     log.info(
-        "Wrote sleep interval %s → Huckleberry (doc %s): start=%s duration=%ds",
+        "Wrote sleep interval %s to Huckleberry (doc %s): start=%s duration=%ds",
         interval.session_id,
         interval_id,
         interval.start.isoformat(),
@@ -95,7 +94,7 @@ async def write_sleep_interval(
             )
             log.debug("Updated prefs.lastSleep for child %s", child_uid)
     except Exception:
-        log.warning("Failed to update prefs.lastSleep -interval already written, continuing.", exc_info=True)
+        log.warning("Failed to update prefs.lastSleep; interval already written, continuing.", exc_info=True)
 
 
 async def make_huckleberry_client(

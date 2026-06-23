@@ -13,7 +13,7 @@ import asyncio
 import logging
 import sys
 import time
-from datetime import datetime, timezone, UTC
+from datetime import datetime, timezone
 
 import aiohttp
 
@@ -64,12 +64,12 @@ async def run_once() -> None:
                         )
                     else:
                         log.warning(
-                            "Active session %s has no usable start time (since_start=%d) -skipping",
+                            "Active session %s has no usable start time (since_start=%d), skipping",
                             state.session_id,
                             state.since_session_start_ms,
                         )
                 else:
-                    # Already tracking -advance last-seen to this poll's wall time
+                    # Already tracking; advance last-seen to this poll's wall time
                     store.update_active_session_event(state.session_id, now_ms)
                     log.debug("Session %s still active, updated last_event_ms.", state.session_id)
 
@@ -85,7 +85,7 @@ async def run_once() -> None:
 
             for session_id, start_ms, last_event_ms in active:
                 if store.seen(session_id):
-                    log.debug("Session %s already written -removing from active.", session_id)
+                    log.debug("Session %s already written, removing from active.", session_id)
                     store.close_active_session(session_id)
                     continue
 
@@ -108,7 +108,6 @@ async def run_once() -> None:
                     session_id=session_id,
                     start=start_dt,
                     end=end_dt,
-                    asleep_seconds=duration_s,
                     total_seconds=duration_s,
                 )
                 to_write.append(ivl)
@@ -120,10 +119,10 @@ async def run_once() -> None:
 
             # ---- Dry-run: log and stop ----
             if dry:
-                log.info("DRY_RUN=true -logging intended writes, nothing will be written.")
+                log.info("DRY_RUN=true; logging intended writes only, nothing will be written.")
                 for ivl in to_write:
                     log.info(
-                        "  WOULD WRITE: %s → %s  (%.1f min)",
+                        "  WOULD WRITE: %s -> %s  (%.1f min)",
                         ivl.start.strftime("%Y-%m-%d %H:%M:%S UTC"),
                         ivl.end.strftime("%H:%M:%S UTC"),
                         ivl.total_seconds / 60,

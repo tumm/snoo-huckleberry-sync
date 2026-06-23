@@ -1,68 +1,70 @@
 # snoo-huckleberry-sync
 
-Syncs completed SNOO sleep sessions into Huckleberry automatically. Polls the SNOO device state every 15 minutes, detects when sessions close, and writes them to Huckleberry. Runs as a single long-running Docker container, suitable for Portainer.
+Automatically syncs completed [SNOO](https://www.happiestbaby.com/pages/snoo) smart bassinet sleep sessions into the [Huckleberry](https://huckleberrycare.com/) baby tracker. Runs as a Docker container that polls the SNOO every 15 minutes and writes closed sessions to Huckleberry.
 
-## Safety invariants
+> **Note:** This uses unofficial, reverse-engineered APIs for both SNOO and Huckleberry. It may break if either app updates its backend.
 
-- **Never writes to SNOO.** All SNOO access is read-only (HTTP GET only).
-- **Only writes to Huckleberry** after you have reviewed a dry run.
-- `DRY_RUN=true` by default. Flip it consciously.
+## How it works
+
+Every 15 minutes the container polls the SNOO device API. When it detects a session has started it records the start time; when the session closes it writes the interval to Huckleberry and marks it as done in a local SQLite database so it is never written twice.
+
+End times are approximated from the last poll that saw the session active, so they are accurate to within one poll interval (15 minutes by default).
+
+## Quick start (Docker / Portainer)
+
+1. Copy `.env.example` to `.env` and fill in your credentials.
+
+2. Run with `DRY_RUN=true` first and check the logs. You should see `WOULD WRITE` lines after a session ends.
+
+3. Once the times look correct, set `DRY_RUN=false` and redeploy.
+
+**docker-compose.yml** (paste into Portainer -> Stacks -> Add stack):
+
+```yaml
+services:
+  snoo-sync:
+    image: ghcr.io/tumm/snoo-huckleberry-sync:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/dedupe.sqlite
+    volumes:
+      - snoo_data:/data
+
+volumes:
+  snoo_data:
+```
+
+The `snoo_data` volume persists the SQLite dedupe store across restarts.
 
 ## Local setup
+
+Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
 cp .env.example .env
 # Edit .env with your credentials
 uv sync
+uv run python -m sync.runner --loop
 ```
 
-## Validate before enabling writes
+## Environment variables
 
-1. Run a pass while a SNOO session is active. It should log "Tracking new SNOO session":
-   ```bash
-   uv run python -m sync.runner
-   ```
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `SNOO_USERNAME` | Yes | | Happiest Baby account email |
+| `SNOO_PASSWORD` | Yes | | Happiest Baby account password |
+| `HUCKLEBERRY_EMAIL` | Yes | | Huckleberry account email |
+| `HUCKLEBERRY_PASSWORD` | Yes | | Huckleberry account password |
+| `HUCKLEBERRY_TIMEZONE` | No | `America/New_York` | Your local timezone (e.g. `Europe/London`) |
+| `HUCKLEBERRY_CHILD_UID` | No | auto-detected | Override if auto-detection picks the wrong child |
+| `INTERVAL_MINUTES` | No | `15` | How often to poll the SNOO |
+| `DRY_RUN` | No | `true` | Log intended writes without touching Huckleberry |
+| `DB_PATH` | No | `/data/dedupe.sqlite` | Path to the SQLite dedupe store |
 
-2. After the session ends, run again. It should log "WOULD WRITE: HH:MM -> HH:MM (X min)":
-   ```bash
-   uv run python -m sync.runner
-   ```
+## Safety
 
-3. Verify the times look correct against the SNOO app, then flip `DRY_RUN=false` in `.env` and run once more to write to Huckleberry.
-
-4. Run one more time to confirm idempotency. It should log "No active sessions to close."
-
-## Portainer deploy
-
-1. Copy this repo to your Portainer host (or point Portainer at the git repo).
-
-2. Copy `.env.example` to `.env` and fill in credentials. Leave `DB_PATH` unset; docker-compose overrides it to `/data/dedupe.sqlite` automatically.
-
-3. In Portainer, go to Stacks -> Add stack, point at `docker-compose.yml` (or paste it). Deploy.
-
-4. The container polls every `INTERVAL_MINUTES` and writes sessions to Huckleberry once `DRY_RUN=false`. The SQLite dedupe store persists in the `snoo_data` named volume across restarts.
-
-## Tunables (`.env`)
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `INTERVAL_MINUTES` | 15 | How often to poll the SNOO device |
-| `DRY_RUN` | true | Log intended writes without touching Huckleberry |
-| `DB_PATH` | ./dedupe.sqlite | SQLite path (overridden to `/data/dedupe.sqlite` in Docker) |
-| `HUCKLEBERRY_TIMEZONE` | America/New_York | Timezone for Huckleberry writes |
-| `HUCKLEBERRY_CHILD_UID` | (auto) | Override child UID; auto-detected from first child if unset |
-
-## How it works
-
-The SNOO REST API (`/hds/me/v11/devices`) returns the current device state on every poll, including `is_active_session`, `session_id`, and `since_session_start_ms`. The sync tool:
-
-1. When `is_active_session=true` with a new `session_id`: records session start, back-computed from `event_time_ms - since_session_start_ms`
-2. Each subsequent poll while active: updates the last-seen wall-clock timestamp
-3. When `is_active_session=false`: writes all tracked sessions to Huckleberry using last-seen active time as the end time (accurate to within one poll interval), then marks them done in the SQLite dedupe store
-
-Sessions shorter than 60 seconds are discarded as false starts.
-
-## Notes
-
-- PubNub history storage is disabled on the SNOO account, so there is no way to fetch historical sessions retroactively. The tool only tracks sessions it observes while running.
-- The SNOO device API does not update `event_time_ms` continuously during a session; it reflects the last state-change event. End times are therefore approximated from wall-clock poll times.
+- Never writes to SNOO. All SNOO access is read-only (HTTP GET only).
+- `DRY_RUN=true` by default. The tool will not write anything to Huckleberry until you explicitly set `DRY_RUN=false`.
+- Sessions shorter than 60 seconds are discarded as noise.
+- The SQLite dedupe store ensures each session is written to Huckleberry exactly once, even if the container restarts mid-session.

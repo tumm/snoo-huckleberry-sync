@@ -1,4 +1,4 @@
-"""Sleep interval data structure used by huckleberry_sink."""
+"""Sleep interval data structure used by huckleberry_sink and runner."""
 
 from __future__ import annotations
 
@@ -11,12 +11,7 @@ class SleepInterval:
     session_id: str
     start: datetime
     end: datetime
-    asleep_seconds: float
     total_seconds: float
-
-    @property
-    def asleep_fraction(self) -> float:
-        return self.asleep_seconds / self.total_seconds if self.total_seconds > 0 else 0.0
 
     def __str__(self) -> str:
         return (
