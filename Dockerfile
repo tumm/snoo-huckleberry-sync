@@ -2,6 +2,8 @@ FROM python:3.12-slim
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
+ENV UV_NO_CACHE=1
+
 WORKDIR /app
 
 # Install dependencies first (cached layer when code changes but deps don't)
