@@ -10,15 +10,46 @@ Every 15 minutes the container polls the SNOO device API. When it detects a sess
 
 End times are approximated from the last poll that saw the session active, so they are accurate to within one poll interval (15 minutes by default).
 
-## Quick start (Docker / Portainer)
+## Quick start (Docker Desktop)
 
-1. Copy `.env.example` to `.env` and fill in your credentials.
+Requires [Docker Desktop](https://www.docker.com/products/docker-desktop/).
 
-2. Deploy the stack. Sessions will be written to Huckleberry automatically.
+1. Clone this repo and enter the directory:
 
-3. To verify before writing, set `DRY_RUN=true` and check the logs for `WOULD WRITE` lines.
+   ```bash
+   git clone https://github.com/tumm/snoo-huckleberry-sync.git
+   cd snoo-huckleberry-sync
+   ```
 
-**docker-compose.yml** (paste into Portainer -> Stacks -> Add stack):
+2. Copy `.env.example` to `.env` and fill in your credentials:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+3. Start the container:
+
+   ```bash
+   docker compose up -d
+   ```
+
+4. Check the logs to confirm it's working:
+
+   ```bash
+   docker compose logs -f
+   ```
+
+   You should see a sync pass logged every 15 minutes. After your baby's next SNOO session ends, a line like `Wrote sleep interval ... to Huckleberry` confirms it's working.
+
+5. To stop: `docker compose down`
+
+The `snoo_data` volume Docker creates persists the SQLite dedupe store across restarts, so sessions are never written twice even if the container is recreated.
+
+> **Tip:** Set `DRY_RUN=true` in `.env` and restart (`docker compose up -d`) to preview what would be written without touching Huckleberry.
+
+## Portainer
+
+In Portainer, go to **Stacks → Add stack**, paste the following, and set the environment variables in the **Env** tab (or use an `.env` file):
 
 ```yaml
 services:
@@ -34,8 +65,6 @@ services:
 volumes:
   snoo_data:
 ```
-
-The `snoo_data` volume persists the SQLite dedupe store across restarts.
 
 ## Local setup
 
