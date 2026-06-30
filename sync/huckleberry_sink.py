@@ -1,18 +1,21 @@
 """Write completed sleep intervals to Huckleberry via Firebase Firestore."""
 
+import hashlib
 import logging
 import time
-import uuid
 
 import aiohttp
 from huckleberry_api import HuckleberryAPI
 from huckleberry_api.firebase_types import (
     FirebaseLastSleepData,
+    FirebaseSleepDetails,
     FirebaseSleepIntervalData,
+    FirebaseSleepLocations,
     to_firebase_dict,
 )
 
-from .session_builder import SleepInterval
+from .snoo_source import SnooCompletedSession
+from . import config
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +38,7 @@ async def resolve_child_uid(hb: HuckleberryAPI, override: str | None) -> str:
 async def write_sleep_interval(
     hb: HuckleberryAPI,
     child_uid: str,
-    interval: SleepInterval,
+    interval: SnooCompletedSession,
 ) -> None:
     """Write one sleep interval to Firestore sleep/{child_uid}/intervals."""
     start_sec = interval.start.timestamp()
@@ -45,17 +48,38 @@ async def write_sleep_interval(
     client = await hb._get_firestore_client()
     sleep_ref = client.collection("sleep").document(child_uid)
 
-    interval_id = uuid.uuid4().hex[:16]
+    interval_id = hashlib.sha256(interval.session_id.encode("utf-8")).hexdigest()[:16]
+    
+    loc_key = config.HUCKLEBERRY_SLEEP_LOCATION
+    valid_locations = {
+        "car", "nursing", "wornOrHeld", "stroller", "coSleep", 
+        "nextToCarer", "onOwnInBed", "bottle", "swing"
+    }
+    if loc_key not in valid_locations:
+        log.warning(
+            "Invalid HUCKLEBERRY_SLEEP_LOCATION '%s', falling back to 'onOwnInBed'. Valid choices: %s", 
+            loc_key, sorted(valid_locations)
+        )
+        loc_key = "onOwnInBed"
+
+    loc_kwargs = {loc_key: True}
+    details = FirebaseSleepDetails(
+        notes=interval.notes,
+        sleepLocations=FirebaseSleepLocations(**loc_kwargs),
+    )
+    
     sleep_data = FirebaseSleepIntervalData(
         start=start_sec,
         duration=duration_sec,
         offset=tz_offset,
         end_offset=tz_offset,
+        details=details,
         lastUpdated=time.time(),
     )
-    await sleep_ref.collection("intervals").document(interval_id).set(
-        to_firebase_dict(sleep_data)
-    )
+    
+    payload = to_firebase_dict(sleep_data)
+
+    await sleep_ref.collection("intervals").document(interval_id).set(payload)
     log.info(
         "Wrote sleep interval %s to Huckleberry (doc %s): start=%s duration=%ds",
         interval.session_id,
@@ -106,3 +130,4 @@ async def make_huckleberry_client(
     hb = HuckleberryAPI(email, password, timezone, websession)
     await hb.authenticate()
     return hb
+

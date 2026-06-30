@@ -1,16 +1,33 @@
 # snoo-huckleberry-sync
 
-Automatically syncs completed [SNOO](https://www.happiestbaby.com/pages/snoo) smart bassinet sleep sessions into the [Huckleberry](https://huckleberrycare.com/) baby tracker. Runs as a Docker container that polls the SNOO every 15 minutes and writes closed sessions to Huckleberry.
+Automatically syncs completed [SNOO](https://www.happiestbaby.com/pages/snoo) smart bassinet sleep sessions into the [Huckleberry](https://huckleberrycare.com/) baby tracker. It connects directly to Huckleberry's Google Firebase Firestore database using the official Google Cloud SDK and parses SNOO's daily history logs to write precise sleep intervals.
 
-> **Note:** This uses unofficial, reverse-engineered APIs for both SNOO and Huckleberry. It may break if either app updates its backend.
+This tool can be run locally as a Python script, scheduled as a task/cron job, or deployed in a Docker container.
 
 ## How it works
 
-Every 15 minutes the container polls the SNOO device API. When it detects a session has started it records the start time; when the session closes it writes the interval to Huckleberry and marks it as done in a local SQLite database so it is never written twice.
+Every 15 minutes, the script retrieves completed sleep sessions from the SNOO daily history API. Timestamps are resolved directly from Happiest Baby's historical logs down to the millisecond, resulting in 100% precise sleep logs in Huckleberry. 
 
-End times are approximated from the last poll that saw the session active, so they are accurate to within one poll interval (15 minutes by default).
+Each sync session calculates the exact sleep metrics (asleep vs. active soothing durations) and saves it into Huckleberry's notes. Synced sessions are cached in a local SQLite database to ensure they are never written twice.
 
-## Quick start (Docker Desktop)
+If you have multiple children on your SNOO or Huckleberry accounts, you can run the utility script to find their unique IDs:
+```bash
+uv run python -m sync.find_child_uids
+```
+Then use `SNOO_BABY_ID` and `HUCKLEBERRY_CHILD_UID` in your `.env` file to select the correct profiles.
+
+## Local setup
+
+Requires [uv](https://docs.astral.sh/uv/).
+
+```bash
+cp .env.example .env
+# Edit .env with your credentials
+uv sync
+uv run python -m sync.runner --loop
+```
+
+## Docker Deployment
 
 Requires [Docker Desktop](https://www.docker.com/products/docker-desktop/).
 
@@ -66,34 +83,29 @@ volumes:
   snoo_data:
 ```
 
-## Local setup
 
-Requires [uv](https://docs.astral.sh/uv/).
-
-```bash
-cp .env.example .env
-# Edit .env with your credentials
-uv sync
-uv run python -m sync.runner --loop
-```
 
 ## Environment variables
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `SNOO_USERNAME` | Yes | | Happiest Baby account email |
-| `SNOO_PASSWORD` | Yes | | Happiest Baby account password |
-| `HUCKLEBERRY_EMAIL` | Yes | | Huckleberry account email |
-| `HUCKLEBERRY_PASSWORD` | Yes | | Huckleberry account password |
-| `HUCKLEBERRY_TIMEZONE` | No | `America/New_York` | Your local timezone (e.g. `Europe/London`) |
-| `HUCKLEBERRY_CHILD_UID` | No | auto-detected | Override if auto-detection picks the wrong child |
-| `INTERVAL_MINUTES` | No | `15` | How often to poll the SNOO |
-| `DRY_RUN` | No | `false` | Log intended writes without touching Huckleberry |
-| `DB_PATH` | No | `/data/dedupe.sqlite` | Path to the SQLite dedupe store |
+| Variable                     | Required | Default               | Description                                        |
+|------------------------------|----------|-----------------------|----------------------------------------------------|
+| `SNOO_USERNAME`              | Yes      |                       | Happiest Baby account email                        |
+| `SNOO_PASSWORD`              | Yes      |                       | Happiest Baby account password                     |
+| `SNOO_BABY_ID`               | No       | auto-detected         | Override if auto-detection picks the wrong baby    |
+| `HUCKLEBERRY_EMAIL`          | Yes      |                       | Huckleberry account email                          |
+| `HUCKLEBERRY_PASSWORD`       | Yes      |                       | Huckleberry account password                       |
+| `HUCKLEBERRY_TIMEZONE`       | No       | `America/New_York`    | Your local timezone (e.g. `Europe/London`)         |
+| `HUCKLEBERRY_CHILD_UID`      | No       | auto-detected         | Override if auto-detection picks the wrong child   |
+| `HUCKLEBERRY_SLEEP_LOCATION` | No       | `onOwnInBed`          | Sleep location category tag                        |
+| `INTERVAL_MINUTES`           | No       | `15`                  | How often to poll the SNOO                         |
+| `MIN_SESSION_MINUTES`        | No       | `1`                   | Discard sleep sessions shorter than this threshold |
+| `HISTORY_DAYS`               | No       | `2`                   | Number of days of SNOO history to sync             |
+| `DRY_RUN`                    | No       | `false`               | Log intended writes without touching Huckleberry   |
+| `DB_PATH`                    | No       | `/data/dedupe.sqlite` | Path to the SQLite dedupe store                    |
 
 ## Safety
 
 - Never writes to SNOO. All SNOO access is read-only (HTTP GET only).
 - Set `DRY_RUN=true` to log intended writes without touching Huckleberry.
-- Sessions shorter than 60 seconds are discarded as noise.
-- The SQLite dedupe store ensures each session is written to Huckleberry exactly once, even if the container restarts mid-session.
+- Sessions shorter than the configured threshold (default is 1 minute) are discarded as noise.
+- The SQLite dedupe store ensures each session is written to Huckleberry exactly once, even if the container restarts.
