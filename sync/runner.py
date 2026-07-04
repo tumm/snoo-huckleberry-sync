@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from datetime import datetime, timezone, timedelta
 
 
 import aiohttp
@@ -72,6 +73,17 @@ async def run_once() -> None:
                         "Session %s too short (%.0fs) - discarding.",
                         sess.session_id,
                         sess.total_seconds,
+                    )
+                    continue
+
+                # Skip sessions that are in progress or ended too recently (using the configured buffer)
+                # This ensures we only sync completed sleep sessions and don't cache premature durations.
+                now_utc = datetime.now(timezone.utc)
+                if now_utc - sess.end < timedelta(minutes=config.IN_PROGRESS_BUFFER_MINUTES):
+                    log.info(
+                        "Session %s is in progress or ended too recently (ended %s) - skipping for now.",
+                        sess.session_id,
+                        sess.end.strftime("%Y-%m-%d %H:%M:%S UTC"),
                     )
                     continue
 
