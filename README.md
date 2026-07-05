@@ -1,14 +1,18 @@
 # snoo-huckleberry-sync
 
-Automatically syncs completed [SNOO](https://www.happiestbaby.com/pages/snoo) smart bassinet sleep sessions into the [Huckleberry](https://huckleberrycare.com/) baby tracker. It connects directly to Huckleberry's Google Firebase Firestore database using the official Google Cloud SDK and parses SNOO's daily history logs to write precise sleep intervals.
+Automatically syncs completed [SNOO](https://www.happiestbaby.com/pages/snoo) smart bassinet sleep sessions into the [Huckleberry](https://huckleberrycare.com/) baby tracker. It connects directly to Huckleberry's Google Firebase Firestore database using the official Google Cloud SDK, and detects completed SNOO sessions in real time to write precise, minute-level sleep intervals — including an asleep/soothing breakdown — without needing a SNOO Premium subscription.
 
 This tool can be run locally as a Python script, scheduled as a task/cron job, or deployed in a Docker container.
 
 ## How it works
 
-Every 15 minutes, the script retrieves completed sleep sessions from the SNOO daily history API. Timestamps are resolved directly from Happiest Baby's historical logs down to the millisecond, resulting in 100% precise sleep logs in Huckleberry. 
+There are three modes, set via `SNOO_MODE`:
 
-Each sync session calculates the exact sleep metrics (asleep vs. active soothing durations) and saves it into Huckleberry's notes. Synced sessions are cached in a local SQLite database to ensure they are never written twice.
+- **`live`** (default, recommended): opens a persistent real-time connection to your SNOO device (AWS IoT MQTT push events — the same mechanism the official [Home Assistant SNOO integration](https://www.home-assistant.io/integrations/snoo) uses). Every state change (asleep, soothing level 1-4, etc.) is captured the instant it happens, so as soon as a session ends it's reconstructed and written to Huckleberry immediately — no polling delay. Works without a SNOO Premium subscription and gives a full minute-level breakdown: total asleep/soothing time, each individual soothing episode with its time range, and a best-effort guess at how the session ended (picked up, timed out, etc).
+- **`basic`**: polls the SNOO device every `INTERVAL_MINUTES` and reconstructs sessions from state changes across polls. Works without Premium, but only reports total sleep duration — no asleep/soothing breakdown — and timestamps are only as precise as your poll interval. Useful as a fallback if `live` mode proves unreliable on your network.
+- **`premium`**: fetches full session history (with an asleep/soothing breakdown) from SNOO's own history API. **Requires an active SNOO Premium subscription** — without one, this endpoint silently returns no data.
+
+Synced sessions are cached in a local SQLite database to ensure they are never written twice, even if the container restarts mid-session.
 
 If you have multiple children on your SNOO or Huckleberry accounts, you can run the utility script to find their unique IDs:
 ```bash
@@ -56,7 +60,7 @@ Requires [Docker Desktop](https://www.docker.com/products/docker-desktop/).
    docker compose logs -f
    ```
 
-   You should see a sync pass logged every 15 minutes. After your baby's next SNOO session ends, a line like `Wrote sleep interval ... to Huckleberry` confirms it's working.
+   With the default `live` mode, you should see a `Starting live mode` line followed by periodic heartbeat lines confirming the connection is alive. After your baby's next SNOO session ends, a line like `Live session ... written to Huckleberry` confirms it's working. (In `basic`/`premium` mode, you'll instead see a sync pass logged every `INTERVAL_MINUTES`.)
 
 5. To stop: `docker compose down`
 
@@ -97,15 +101,18 @@ volumes:
 | `HUCKLEBERRY_TIMEZONE`       | No       | `America/New_York`    | Your local timezone (e.g. `Europe/London`)         |
 | `HUCKLEBERRY_CHILD_UID`      | No       | auto-detected         | Override if auto-detection picks the wrong child   |
 | `HUCKLEBERRY_SLEEP_LOCATION` | No       | `onOwnInBed`          | Sleep location category tag                        |
-| `INTERVAL_MINUTES`           | No       | `15`                  | How often to poll the SNOO                         |
+| `SNOO_MODE`                  | No       | `live`                | Detection mode: `live`, `basic`, or `premium` (see [How it works](#how-it-works)) |
+| `INTERVAL_MINUTES`           | No       | `15`                  | In `basic`/`premium` mode: how often to poll the SNOO. In `live` mode: how often to check the connection is still alive and reconnect if not |
 | `MIN_SESSION_MINUTES`        | No       | `1`                   | Discard sleep sessions shorter than this threshold |
-| `HISTORY_DAYS`               | No       | `2`                   | Number of days of SNOO history to sync             |
+| `HISTORY_DAYS`               | No       | `2`                   | `premium` mode only: number of days of SNOO history to sync |
+| `IN_PROGRESS_BUFFER_MINUTES` | No       | `5`                   | `premium` mode only: buffer to avoid syncing a session that might still be in progress |
 | `DRY_RUN`                    | No       | `false`               | Log intended writes without touching Huckleberry   |
 | `DB_PATH`                    | No       | `/data/dedupe.sqlite` | Path to the SQLite dedupe store                    |
 
 ## Safety
 
-- Never writes to SNOO. All SNOO access is read-only (HTTP GET only).
+- Never writes to SNOO. All SNOO access is read-only — HTTP GET in `basic`/`premium` mode, a read-only MQTT subscription in `live` mode.
 - Set `DRY_RUN=true` to log intended writes without touching Huckleberry.
 - Sessions shorter than the configured threshold (default is 1 minute) are discarded as noise.
 - The SQLite dedupe store ensures each session is written to Huckleberry exactly once, even if the container restarts.
+- In `live` mode, each state transition is persisted to SQLite as it arrives, so a restart mid-session resumes tracking instead of losing it.
