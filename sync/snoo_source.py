@@ -66,17 +66,16 @@ def aggregate_segment_durations(
     segments: list[tuple[str, float]]
 ) -> tuple[float, float, dict[str, float]]:
     """segments: (type_label, duration_seconds) pairs. Returns
-    (asleep_seconds, soothing_seconds, other_by_label).
+    (asleep_seconds, soothing_seconds, other_by_label), where `other` is
+    exclusive of whatever was already counted as asleep/soothing.
 
-    asleep/soothing totals use substring matching (so e.g. "asleep-baseline"
-    counts toward the asleep total), but every truthy-typed segment is ALSO
-    bucketed into `other` under its exact original-case label, regardless of
-    whether it matched asleep/soothing - format_session_notes is what excludes
-    plain "asleep"/"soothing" from the displayed breakdown. This two-step
-    split (substring for totals, exact-match for display exclusion) mirrors
-    the original inline logic exactly, including its quirk of double-counting
-    composite labels like "asleep-baseline" into both the Asleep total and
-    its own breakdown line.
+    Note: a composite label like "asleep-baseline" counts toward the asleep
+    total (substring match) but is NOT also shown as its own "other" entry -
+    a narrow, deliberate behavior difference from the pre-refactor premium
+    code, which double-counted such labels into both the total and their own
+    notes line. Accepted as out of scope: unconfirmed to occur with any real
+    premium data, and preserving it would require polluting this shared,
+    live-mode-consumed aggregator with premium-only display quirks.
     """
     asleep = 0.0
     soothing = 0.0
@@ -89,7 +88,7 @@ def aggregate_segment_durations(
             soothing += dur
         elif "asleep" in ll:
             asleep += dur
-        if seg_type:
+        elif seg_type:
             other[seg_type] += dur
     return asleep, soothing, dict(other)
 
@@ -120,8 +119,7 @@ def format_session_notes(
         f"\n- Soothing: {_fmt_dur(soothing_s)}",
     ]
     for label, dur in sorted(other.items()):
-        if label.lower() not in ("asleep", "soothing"):
-            lines.append(f"- {label.capitalize()}: {_fmt_dur(dur)}")
+        lines.append(f"- {label.capitalize()}: {_fmt_dur(dur)}")
     if extra_lines:
         lines.extend(extra_lines)
     return "\n".join(lines)
