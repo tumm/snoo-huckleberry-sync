@@ -1,0 +1,129 @@
+"""Reconstructs completed SNOO sleep sessions from live MQTT push events.
+
+Pure logic, no network/Firestore I/O - sync/runner.py wires this to
+python-snoo's live subscription and to Huckleberry writes.
+
+IMPORTANT: python-snoo's SnooStateMachine.is_active_session is always True
+after deserialization (mashumaro coerces the device's literal "false" string
+into a truthy Python bool) - do not read it. session_id == "0" is the
+reliable inactive signal, matching sync/snoo_source.py's REST-based
+SnooDeviceState convention.
+"""
+
+import logging
+from datetime import datetime, timezone
+
+from python_snoo.containers import SnooData, SnooEvents
+
+from .dedupe import DedupeStore
+from .snoo_source import (
+    SnooCompletedSession,
+    aggregate_segment_durations,
+    back_compute_start_ms,
+    format_session_notes,
+)
+
+log = logging.getLogger(__name__)
+
+_ASLEEP_STATES = {"BASELINE", "WEANING_BASELINE"}
+_SOOTHING_STATES = {"LEVEL1", "LEVEL2", "LEVEL3", "LEVEL4"}
+
+
+def _classify_state(state: str) -> tuple[str, str | None]:
+    """Map a raw device state to (aggregation bucket label, optional individual
+    sub-label). Soothing levels count toward the "soothing" summary total AND
+    keep their own label (e.g. "Level2") so they also show as their own line."""
+    s = (state or "").upper()
+    if s in _ASLEEP_STATES:
+        return "asleep", None
+    if s in _SOOTHING_STATES:
+        return "soothing", s.capitalize()
+    return (state.capitalize() if state else "Unknown"), None
+
+
+def _infer_wake_reason(events: list[tuple[int, str]], closing_data: SnooData) -> str | None:
+    """Best-effort guess at how the session ended, from the closing push event.
+    Unvalidated against real sessions - expect to refine after real data lands."""
+    last_state = events[-1][1].upper() if events else ""
+    if closing_data.left_safety_clip == 0 or closing_data.right_safety_clip == 0:
+        return "Picked up out of SNOO"
+    if last_state == "TIMEOUT":
+        return "Soothing timed out without settling"
+    if last_state == "SUSPENDED":
+        return "Session stopped manually"
+    if closing_data.event == SnooEvents.CRY:
+        return "Ended after sustained crying"
+    return None
+
+
+class LiveSessionTracker:
+    """Tracks in-progress SNOO sessions across live push events, persisting
+    each state transition to SQLite as it arrives so a process restart
+    mid-session resumes from the persisted events instead of losing them."""
+
+    def __init__(self, store: DedupeStore, min_session_seconds: float) -> None:
+        self._store = store
+        self._min_session_seconds = min_session_seconds
+
+    def handle_event(self, data: SnooData) -> list[SnooCompletedSession]:
+        session_id = str(data.state_machine.session_id)
+        if session_id in ("0", ""):
+            return self._close_open_sessions(data)
+
+        state = str(data.state_machine.state)
+        existing = self._store.get_live_events(session_id)
+        if not existing:
+            start_ms = back_compute_start_ms(
+                data.event_time_ms, data.state_machine.since_session_start_ms
+            )
+            if start_ms is None:
+                start_ms = data.event_time_ms
+            self._store.append_live_event(session_id, start_ms, state)
+            log.info(
+                "Tracking new live SNOO session %s (started %s)",
+                session_id,
+                datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat(),
+            )
+        else:
+            self._store.append_live_event(session_id, data.event_time_ms, state)
+        return []
+
+    def _close_open_sessions(self, closing_data: SnooData) -> list[SnooCompletedSession]:
+        completed: list[SnooCompletedSession] = []
+        for session_id in self._store.open_live_session_ids():
+            events = self._store.get_live_events(session_id)
+            self._store.clear_live_events(session_id)
+
+            if not events:
+                log.warning("Live session %s had no recorded events, discarding.", session_id)
+                continue
+
+            start_ms = events[0][0]
+            end_ms = closing_data.event_time_ms
+            total_seconds = (end_ms - start_ms) / 1000
+            if total_seconds < self._min_session_seconds:
+                log.info("Live session %s too short (%.0fs) - discarding.", session_id, total_seconds)
+                continue
+
+            segments: list[tuple[str, float]] = []
+            for i, (t_ms, state) in enumerate(events):
+                next_ms = events[i + 1][0] if i + 1 < len(events) else end_ms
+                dur = (next_ms - t_ms) / 1000
+                bucket_label, sub_label = _classify_state(state)
+                segments.append((bucket_label, dur))
+                if sub_label:
+                    segments.append((sub_label, dur))
+
+            asleep_s, soothing_s, other = aggregate_segment_durations(segments)
+            wake_reason = _infer_wake_reason(events, closing_data)
+            extra_lines = [f"- Ended: {wake_reason}"] if wake_reason else None
+            notes = format_session_notes(asleep_s, soothing_s, other, extra_lines=extra_lines)
+
+            completed.append(SnooCompletedSession(
+                session_id=session_id,
+                start=datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc),
+                end=datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc),
+                total_seconds=total_seconds,
+                notes=notes,
+            ))
+        return completed
