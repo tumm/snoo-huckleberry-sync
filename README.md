@@ -1,6 +1,6 @@
 # snoo-huckleberry-sync
 
-Automatically syncs completed [SNOO](https://www.happiestbaby.com/pages/snoo) smart bassinet sleep sessions into the [Huckleberry](https://huckleberrycare.com/) baby tracker. It connects directly to Huckleberry's Google Firebase Firestore database using the official Google Cloud SDK, and detects completed SNOO sessions in real time to write precise, minute-level sleep intervals — including an asleep/soothing breakdown — without needing a SNOO Premium subscription.
+Automatically syncs completed [SNOO](https://www.happiestbaby.com/pages/snoo) smart bassinet sleep sessions into the [Huckleberry](https://huckleberrycare.com/) baby tracker. It connects directly to Huckleberry's Google Firebase Firestore database using the official Google Cloud SDK, and detects completed SNOO sessions in real time to write precise, minute-level sleep intervals, including an asleep/soothing breakdown, without needing a SNOO Premium subscription.
 
 This tool can be run locally as a Python script, scheduled as a task/cron job, or deployed in a Docker container.
 
@@ -8,9 +8,9 @@ This tool can be run locally as a Python script, scheduled as a task/cron job, o
 
 There are three modes, set via `SNOO_MODE`:
 
-- **`live`** (default, recommended): opens a persistent real-time connection to your SNOO device (AWS IoT MQTT push events — the same mechanism the official [Home Assistant SNOO integration](https://www.home-assistant.io/integrations/snoo) uses). Every state change (asleep, soothing level 1-4, etc.) is captured the instant it happens, so as soon as a session ends it's reconstructed and written to Huckleberry immediately — no polling delay. Works without a SNOO Premium subscription and gives a full minute-level breakdown: total asleep/soothing time, each individual soothing episode with its time range, and a best-effort guess at how the session ended (picked up, timed out, etc).
-- **`basic`**: polls the SNOO device every `INTERVAL_MINUTES` and reconstructs sessions from state changes across polls. Works without Premium, but only reports total sleep duration — no asleep/soothing breakdown — and timestamps are only as precise as your poll interval. Useful as a fallback if `live` mode proves unreliable on your network.
-- **`premium`**: fetches full session history (with an asleep/soothing breakdown) from SNOO's own history API. **Requires an active SNOO Premium subscription** — without one, this endpoint silently returns no data.
+- **`live`** (default, recommended): opens a persistent real-time connection to your SNOO device (AWS IoT MQTT push events, the same mechanism the official [Home Assistant SNOO integration](https://www.home-assistant.io/integrations/snoo) uses). Every state change (asleep, soothing level 1-4, etc.) is captured the instant it happens, so as soon as a session ends it's reconstructed and written to Huckleberry immediately, with no polling delay. Works without a SNOO Premium subscription and gives a full minute-level breakdown: total asleep/soothing time, each individual soothing episode with its time range, and a best-effort guess at how the session ended (picked up, timed out, etc).
+- **`basic`**: polls the SNOO device every `INTERVAL_MINUTES` and reconstructs sessions from state changes across polls. Works without Premium, but only reports total sleep duration (no asleep/soothing breakdown), and timestamps are only as precise as your poll interval. Useful as a fallback if `live` mode proves unreliable on your network.
+- **`premium`**: fetches full session history (with an asleep/soothing breakdown) from SNOO's own history API. **Requires an active SNOO Premium subscription**; without one, this endpoint silently returns no data.
 
 Synced sessions are cached in a local SQLite database to ensure they are never written twice, even if the container restarts mid-session.
 
@@ -111,7 +111,7 @@ volumes:
 
 ## Safety
 
-- Never writes to SNOO. All SNOO access is read-only — HTTP GET in `basic`/`premium` mode, a read-only MQTT subscription in `live` mode.
+- Never writes to SNOO. All SNOO access is read-only: HTTP GET in `basic`/`premium` mode, a read-only MQTT subscription in `live` mode.
 - Set `DRY_RUN=true` to log intended writes without touching Huckleberry.
 - Sessions shorter than the configured threshold (default is 1 minute) are discarded as noise.
 - The SQLite dedupe store ensures each session is written to Huckleberry exactly once, even if the container restarts.

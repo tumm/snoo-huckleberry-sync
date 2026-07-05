@@ -52,4 +52,4 @@ The SQLite file (`DB_PATH`, default `/data/dedupe.sqlite`) must be on a persiste
 
 ### Unofficial APIs & Databases
 
-SNOO uses reverse-engineered API endpoints (via `python-snoo`, calling `/ss/me/v11/babies/{baby_id}/sessions/daily` in premium mode, `/hds/me/v11/devices` in basic mode, or AWS IoT MQTT in live mode — the HTTP endpoints are not part of the `python-snoo` library itself). Huckleberry sleep intervals are written directly to Huckleberry's Google Firebase Firestore database using the official Google Cloud Firestore SDK. Changes in either platform's backend structure can silently break this tool.
+SNOO uses reverse-engineered API endpoints (via `python-snoo`, calling `/ss/me/v11/babies/{baby_id}/sessions/daily` in premium mode, `/hds/me/v11/devices` in basic mode, or AWS IoT MQTT in live mode; the HTTP endpoints are not part of the `python-snoo` library itself). Huckleberry sleep intervals are written directly to Huckleberry's Google Firebase Firestore database using the official Google Cloud Firestore SDK. Changes in either platform's backend structure can silently break this tool.
