@@ -1,5 +1,7 @@
 .venv/
 .env
+.claude/worktrees/
+.superpowers/
 *.sqlite
 *.db
 .snoo_token.txt

@@ -18,6 +18,7 @@ from typing import Callable
 
 
 import aiohttp
+from python_snoo.containers import SnooData
 
 # Run Windows gRPC SSL setup before importing packages that use gRPC
 from .ssl_helper import get_ssl_context, setup_grpc_ssl
@@ -26,7 +27,8 @@ setup_grpc_ssl()
 from . import config
 from .dedupe import DedupeStore
 from .huckleberry_sink import make_huckleberry_client, resolve_child_uid, write_sleep_interval
-from .snoo_source import fetch_past_sessions, fetch_device_state, SnooCompletedSession
+from .live_source import LiveSessionTracker
+from .snoo_source import fetch_past_sessions, fetch_device_state, start_live_subscription, SnooCompletedSession
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,7 +42,7 @@ _MIN_SESSION_SECONDS = config.MIN_SESSION_MINUTES * 60  # ignore sessions shorte
 
 _NO_BREAKDOWN_NOTES = (
     "SNOO Sleep Session (basic tracking - total duration only).\n"
-    "Enable SNOO_PREMIUM in .env for an asleep/soothing breakdown once subscribed."
+    "Set SNOO_MODE=premium or SNOO_MODE=live in .env for an asleep/soothing breakdown."
 )
 
 
@@ -213,10 +215,126 @@ async def _run_once_basic(session: aiohttp.ClientSession, store: DedupeStore, dr
     )
 
 
+async def _write_one_live_session(
+    store: DedupeStore,
+    hb,
+    child_uid: str | None,
+    sess: SnooCompletedSession,
+    dry: bool,
+) -> None:
+    if dry:
+        log.info(
+            "  WOULD WRITE: %s -> %s  (%.1f min)\nNotes:\n%s",
+            sess.start.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            sess.end.strftime("%H:%M:%S UTC"),
+            sess.total_seconds / 60,
+            sess.notes,
+        )
+        return
+
+    if store.seen(sess.session_id):
+        log.debug("Live session %s already written, skipping.", sess.session_id)
+        return
+
+    # This runs as a fire-and-forget asyncio.create_task from on_message, with no
+    # caller left to see an exception - by the time this session reaches here its
+    # source events are already cleared from SQLite (LiveSessionTracker's job is
+    # done), so a failure here means the reconstructed session data is gone for
+    # good unless it's at least logged loudly for a human to notice and recover
+    # manually (e.g. from these log lines) rather than vanishing into asyncio's
+    # generic "Task exception was never retrieved" warning.
+    try:
+        await write_sleep_interval(hb, child_uid, sess)
+        store.mark(sess.session_id, sess.start, sess.end)
+        log.info("Live session %s written to Huckleberry.", sess.session_id)
+    except Exception:
+        log.error(
+            "Failed to write live session %s to Huckleberry - this session's data is "
+            "now lost (source events already cleared). start=%s end=%s notes:\n%s",
+            sess.session_id,
+            sess.start.isoformat(),
+            sess.end.isoformat(),
+            sess.notes,
+            exc_info=True,
+        )
+
+
+async def _run_live() -> None:
+    """Persistent live mode: never returns. Listens to AWS IoT MQTT push
+    events and writes completed sessions to Huckleberry as they close,
+    instead of waiting for a poll interval."""
+    dry = config.DRY_RUN
+    log.info("Starting live mode (DRY_RUN=%s) - persistent MQTT session tracking.", dry)
+
+    store = DedupeStore(config.DB_PATH)
+    tracker = LiveSessionTracker(store, _MIN_SESSION_SECONDS)
+
+    import os
+    connector = aiohttp.TCPConnector(ssl=False) if os.name == "nt" else None
+    async with aiohttp.ClientSession(connector=connector) as session:
+        hb = None
+        child_uid = None
+        if not dry:
+            hb = await make_huckleberry_client(
+                session, config.HUCKLEBERRY_EMAIL, config.HUCKLEBERRY_PASSWORD, config.HUCKLEBERRY_TIMEZONE,
+            )
+            child_uid = await resolve_child_uid(hb, config.HUCKLEBERRY_CHILD_UID)
+
+        # Strong references to fire-and-forget write tasks - asyncio.Task only
+        # holds a weak reference internally, so without this a task can be
+        # garbage-collected mid-flight, silently dropping a write with no
+        # error logged at all.
+        _pending_writes: set[asyncio.Task] = set()
+
+        def on_message(data: SnooData) -> None:
+            try:
+                completed = tracker.handle_event(data)
+            except Exception:
+                log.error("Error handling live event, dropping it.", exc_info=True)
+                return
+            for sess in completed:
+                task = asyncio.create_task(_write_one_live_session(store, hb, child_uid, sess, dry))
+                _pending_writes.add(task)
+                task.add_done_callback(_pending_writes.discard)
+
+        snoo, device = await start_live_subscription(
+            session, config.SNOO_USERNAME, config.SNOO_PASSWORD, on_message
+        )
+
+        # Heartbeat + resubscribe watchdog. python-snoo doesn't expose a public
+        # "is this subscription alive" API, so this reaches into its internal
+        # _mqtt_tasks map - fragile if the library restructures, but there's no
+        # supported alternative and the cost of missing a dead connection in an
+        # unattended Portainer deployment is silent, indefinite data loss.
+        heartbeat_s = config.INTERVAL_MINUTES * 60
+        while True:
+            await asyncio.sleep(heartbeat_s)
+            task = snoo._mqtt_tasks.get(device.serialNumber)
+            if task is None or task.done():
+                log.warning("Live MQTT subscription for %s is not running - resubscribing.", device.serialNumber)
+                snoo.start_subscribe(device, on_message)
+                # Re-seed a fresh read of the device's actual current session_id as
+                # soon as possible after reconnecting, rather than waiting for the
+                # next organic transition - otherwise a session that was open before
+                # the connection dropped never gets closed until some unrelated
+                # future session's closing event arrives (see
+                # LiveSessionTracker._close_open_sessions's stale-session handling).
+                try:
+                    await snoo.get_status(device)
+                except Exception:
+                    log.warning(
+                        "Post-resubscribe device status request for %s failed or "
+                        "timed out; will pick up state on the next real transition.",
+                        device.serialNumber,
+                        exc_info=True,
+                    )
+            else:
+                log.info("Live mode heartbeat: MQTT subscription alive for %s.", device.serialNumber)
+
+
 async def run_once() -> None:
     dry = config.DRY_RUN
-    mode = "premium" if config.SNOO_PREMIUM else "basic (device-polling)"
-    log.info("Starting sync pass (DRY_RUN=%s, mode=%s, interval=%.0fmin)", dry, mode, config.INTERVAL_MINUTES)
+    log.info("Starting sync pass (DRY_RUN=%s, mode=%s, interval=%.0fmin)", dry, config.SNOO_MODE, config.INTERVAL_MINUTES)
 
     store = DedupeStore(config.DB_PATH)
 
@@ -224,7 +342,7 @@ async def run_once() -> None:
     connector = aiohttp.TCPConnector(ssl=False) if os.name == "nt" else None
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
-            if config.SNOO_PREMIUM:
+            if config.SNOO_MODE == "premium":
                 await _run_once_premium(session, store, dry)
             else:
                 await _run_once_basic(session, store, dry)
@@ -250,7 +368,9 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        if args.loop:
+        if config.SNOO_MODE == "live":
+            asyncio.run(_run_live())
+        elif args.loop:
             asyncio.run(run_loop())
         else:
             asyncio.run(run_once())

@@ -4,10 +4,12 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 import aiohttp
 from python_snoo.snoo import Snoo
+from python_snoo.containers import SnooData, SnooDevice
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +53,78 @@ class SnooDeviceState:
     @property
     def event_time(self) -> datetime:
         return datetime.fromtimestamp(self.event_time_ms / 1000, tz=timezone.utc)
+
+
+def back_compute_start_ms(event_time_ms: int, since_session_start_ms: int | None) -> int | None:
+    """Back-compute when a session began from a device event's timestamp and its
+    reported elapsed-since-start. Returns None if the device hasn't reported a
+    valid elapsed value (e.g. -1, meaning no session in progress)."""
+    if since_session_start_ms is None or since_session_start_ms < 0:
+        return None
+    return event_time_ms - since_session_start_ms
+
+
+def aggregate_segment_durations(
+    segments: list[tuple[str, float]]
+) -> tuple[float, float, dict[str, float]]:
+    """segments: (type_label, duration_seconds) pairs. Returns
+    (asleep_seconds, soothing_seconds, other_by_label), where `other` is
+    exclusive of whatever was already counted as asleep/soothing.
+
+    Note: a composite label like "asleep-baseline" counts toward the asleep
+    total (substring match) but is NOT also shown as its own "other" entry -
+    a narrow, deliberate behavior difference from the pre-refactor premium
+    code, which double-counted such labels into both the total and their own
+    notes line. Accepted as out of scope: unconfirmed to occur with any real
+    premium data, and preserving it would require polluting this shared,
+    live-mode-consumed aggregator with premium-only display quirks.
+    """
+    asleep = 0.0
+    soothing = 0.0
+    other: dict[str, float] = defaultdict(float)
+    for seg_type, dur in segments:
+        if not isinstance(dur, (int, float)):
+            continue
+        ll = (seg_type or "").lower()
+        if "soothing" in ll:
+            soothing += dur
+        elif "asleep" in ll:
+            asleep += dur
+        elif seg_type:
+            other[seg_type] += dur
+    return asleep, soothing, dict(other)
+
+
+def fmt_dur(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    parts = []
+    if h > 0:
+        parts.append(f"{h}h")
+    if m > 0:
+        parts.append(f"{m}m")
+    if s > 0 or not parts:
+        parts.append(f"{s}s")
+    return " ".join(parts)
+
+
+def format_session_notes(
+    asleep_s: float,
+    soothing_s: float,
+    other: dict[str, float],
+    extra_lines: list[str] | None = None,
+) -> str:
+    lines = [
+        "SNOO Sleep Session Summary:",
+        f"\n- Asleep: {fmt_dur(asleep_s)}",
+        f"\n- Soothing: {fmt_dur(soothing_s)}",
+    ]
+    for label, dur in sorted(other.items()):
+        lines.append(f"- {label.capitalize()}: {fmt_dur(dur)}")
+    if extra_lines:
+        lines.extend(extra_lines)
+    return "\n".join(lines)
 
 
 async def fetch_device_state(
@@ -107,6 +181,45 @@ async def fetch_device_state(
         since_start // 1000 if since_start > 0 else -1,
     )
     return state
+
+
+async def start_live_subscription(
+    websession: aiohttp.ClientSession,
+    username: str,
+    password: str,
+    on_message: Callable[[SnooData], None],
+) -> tuple[Snoo, SnooDevice]:
+    """Authenticate, resolve the account's first SNOO device, and start a
+    persistent AWS IoT MQTT subscription delivering live state-transition
+    events - the same mechanism the official Home Assistant SNOO integration
+    uses (see homeassistant/components/snoo/coordinator.py upstream).
+
+    Returns (snoo, device) so the caller can run a heartbeat/resubscribe
+    watchdog (checking snoo._mqtt_tasks[device.serialNumber] and calling
+    snoo.start_subscribe(device, on_message) again if it died) and keep the
+    Snoo instance alive for its automatic token-refresh/resubscription.
+    """
+    snoo = Snoo(username, password, websession)
+    await snoo.authorize()
+
+    devices = await snoo.get_devices()
+    if not devices:
+        raise RuntimeError("No SNOO devices found on this account")
+    device = devices[0]
+    log.info("Live mode tracking device %s (%s)", device.serialNumber, device.name)
+
+    snoo.start_subscribe(device, on_message)
+    try:
+        await snoo.get_status(device)
+    except Exception:
+        log.warning(
+            "Initial device status request for %s failed or timed out; the live "
+            "subscription is still active and will pick up state on the next "
+            "real transition.",
+            device.serialNumber,
+            exc_info=True,
+        )
+    return snoo, device
 
 
 async def fetch_past_sessions(
@@ -224,37 +337,10 @@ async def fetch_past_sessions(
 
         end_dt_utc = start_dt_utc + timedelta(seconds=total_duration)
 
-        def fmt_dur(seconds: float) -> str:
-            h = int(seconds // 3600)
-            m = int((seconds % 3600) // 60)
-            s = int(seconds % 60)
-            parts = []
-            if h > 0:
-                parts.append(f"{h}h")
-            if m > 0:
-                parts.append(f"{m}m")
-            if s > 0 or not parts:
-                parts.append(f"{s}s")
-            return " ".join(parts)
-
-        notes_lines = [
-            "SNOO Sleep Session Summary:",
-            f"\n- Asleep: {fmt_dur(asleep_duration)}",
-            f"\n- Soothing: {fmt_dur(soothing_duration)}",
-        ]
-        
-        other_states = defaultdict(float)
-        for seg in segments:
-            seg_type = seg.get("type", "")
-            dur = seg.get("stateDuration")
-            if seg_type and isinstance(dur, (int, float)):
-                other_states[seg_type] += dur
-
-        for stype, sdur in sorted(other_states.items()):
-            if stype.lower() not in ("asleep", "soothing"):
-                notes_lines.append(f"- {stype.capitalize()}: {fmt_dur(sdur)}")
-
-        notes = "\n".join(notes_lines)
+        _, _, other_states = aggregate_segment_durations(
+            [(seg.get("type", ""), seg.get("stateDuration")) for seg in segments]
+        )
+        notes = format_session_notes(asleep_duration, soothing_duration, other_states)
 
         completed_sessions.append(SnooCompletedSession(
             session_id=session_id,
