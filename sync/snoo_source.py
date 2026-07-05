@@ -66,7 +66,18 @@ def aggregate_segment_durations(
     segments: list[tuple[str, float]]
 ) -> tuple[float, float, dict[str, float]]:
     """segments: (type_label, duration_seconds) pairs. Returns
-    (asleep_seconds, soothing_seconds, other_by_label)."""
+    (asleep_seconds, soothing_seconds, other_by_label).
+
+    asleep/soothing totals use substring matching (so e.g. "asleep-baseline"
+    counts toward the asleep total), but every truthy-typed segment is ALSO
+    bucketed into `other` under its exact original-case label, regardless of
+    whether it matched asleep/soothing - format_session_notes is what excludes
+    plain "asleep"/"soothing" from the displayed breakdown. This two-step
+    split (substring for totals, exact-match for display exclusion) mirrors
+    the original inline logic exactly, including its quirk of double-counting
+    composite labels like "asleep-baseline" into both the Asleep total and
+    its own breakdown line.
+    """
     asleep = 0.0
     soothing = 0.0
     other: dict[str, float] = defaultdict(float)
@@ -78,7 +89,7 @@ def aggregate_segment_durations(
             soothing += dur
         elif "asleep" in ll:
             asleep += dur
-        elif seg_type:
+        if seg_type:
             other[seg_type] += dur
     return asleep, soothing, dict(other)
 
@@ -109,7 +120,8 @@ def format_session_notes(
         f"\n- Soothing: {_fmt_dur(soothing_s)}",
     ]
     for label, dur in sorted(other.items()):
-        lines.append(f"- {label.capitalize()}: {_fmt_dur(dur)}")
+        if label.lower() not in ("asleep", "soothing"):
+            lines.append(f"- {label.capitalize()}: {_fmt_dur(dur)}")
     if extra_lines:
         lines.extend(extra_lines)
     return "\n".join(lines)
