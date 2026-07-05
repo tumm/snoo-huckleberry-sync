@@ -4,10 +4,12 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 import aiohttp
 from python_snoo.snoo import Snoo
+from python_snoo.containers import SnooData, SnooDevice
 
 log = logging.getLogger(__name__)
 
@@ -179,6 +181,36 @@ async def fetch_device_state(
         since_start // 1000 if since_start > 0 else -1,
     )
     return state
+
+
+async def start_live_subscription(
+    websession: aiohttp.ClientSession,
+    username: str,
+    password: str,
+    on_message: Callable[[SnooData], None],
+) -> tuple[Snoo, SnooDevice]:
+    """Authenticate, resolve the account's first SNOO device, and start a
+    persistent AWS IoT MQTT subscription delivering live state-transition
+    events - the same mechanism the official Home Assistant SNOO integration
+    uses (see homeassistant/components/snoo/coordinator.py upstream).
+
+    Returns (snoo, device) so the caller can run a heartbeat/resubscribe
+    watchdog (checking snoo._mqtt_tasks[device.serialNumber] and calling
+    snoo.start_subscribe(device, on_message) again if it died) and keep the
+    Snoo instance alive for its automatic token-refresh/resubscription.
+    """
+    snoo = Snoo(username, password, websession)
+    await snoo.authorize()
+
+    devices = await snoo.get_devices()
+    if not devices:
+        raise RuntimeError("No SNOO devices found on this account")
+    device = devices[0]
+    log.info("Live mode tracking device %s (%s)", device.serialNumber, device.name)
+
+    snoo.start_subscribe(device, on_message)
+    await snoo.get_status(device)
+    return snoo, device
 
 
 async def fetch_past_sessions(
