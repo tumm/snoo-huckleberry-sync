@@ -1,7 +1,8 @@
 """SQLite-backed idempotency store.
 
-written_sessions - sessions already synced to Huckleberry (permanent).
-active_sessions  - sessions currently in progress on the SNOO (transient; non-premium mode only).
+written_sessions    - sessions already synced to Huckleberry (permanent).
+active_sessions     - sessions currently in progress on the SNOO (transient; basic mode only).
+live_session_events - per-state-transition event log for in-progress sessions (transient; live mode only).
 """
 
 import logging
@@ -24,6 +25,13 @@ CREATE TABLE IF NOT EXISTS active_sessions (
     last_event_ms   INTEGER NOT NULL,
     first_seen      TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS live_session_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
+    event_time_ms INTEGER NOT NULL,
+    state         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_live_session_events_session_id ON live_session_events(session_id);
 """
 
 
@@ -85,6 +93,34 @@ class DedupeStore:
         )
         self._conn.commit()
         log.debug("Closed active session %s", session_id)
+
+    # ---- live session event tracking (live MQTT mode) ----
+
+    def append_live_event(self, session_id: str, event_time_ms: int, state: str) -> None:
+        self._conn.execute(
+            "INSERT INTO live_session_events (session_id, event_time_ms, state) VALUES (?, ?, ?)",
+            (session_id, event_time_ms, state),
+        )
+        self._conn.commit()
+
+    def get_live_events(self, session_id: str) -> list[tuple[int, str]]:
+        """Return (event_time_ms, state) rows for a session, oldest first."""
+        cur = self._conn.execute(
+            "SELECT event_time_ms, state FROM live_session_events WHERE session_id = ? ORDER BY id ASC",
+            (session_id,),
+        )
+        return cur.fetchall()
+
+    def clear_live_events(self, session_id: str) -> None:
+        self._conn.execute("DELETE FROM live_session_events WHERE session_id = ?", (session_id,))
+        self._conn.commit()
+
+    def open_live_session_ids(self) -> list[str]:
+        """Distinct session_ids currently being tracked, oldest-opened first."""
+        cur = self._conn.execute(
+            "SELECT session_id FROM live_session_events GROUP BY session_id ORDER BY MIN(id)"
+        )
+        return [row[0] for row in cur.fetchall()]
 
     def close(self) -> None:
         self._conn.close()
