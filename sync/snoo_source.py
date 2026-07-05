@@ -95,7 +95,7 @@ def aggregate_segment_durations(
     return asleep, soothing, dict(other)
 
 
-def _fmt_dur(seconds: float) -> str:
+def fmt_dur(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
@@ -117,11 +117,11 @@ def format_session_notes(
 ) -> str:
     lines = [
         "SNOO Sleep Session Summary:",
-        f"\n- Asleep: {_fmt_dur(asleep_s)}",
-        f"\n- Soothing: {_fmt_dur(soothing_s)}",
+        f"\n- Asleep: {fmt_dur(asleep_s)}",
+        f"\n- Soothing: {fmt_dur(soothing_s)}",
     ]
     for label, dur in sorted(other.items()):
-        lines.append(f"- {label.capitalize()}: {_fmt_dur(dur)}")
+        lines.append(f"- {label.capitalize()}: {fmt_dur(dur)}")
     if extra_lines:
         lines.extend(extra_lines)
     return "\n".join(lines)

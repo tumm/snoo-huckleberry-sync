@@ -20,6 +20,7 @@ from .snoo_source import (
     SnooCompletedSession,
     aggregate_segment_durations,
     back_compute_start_ms,
+    fmt_dur,
     format_session_notes,
 )
 
@@ -43,6 +44,48 @@ def _classify_state(state: str) -> tuple[str, str | None]:
     if s in _SOOTHING_STATES:
         return "soothing", s.capitalize()
     return (state.capitalize() if state else "Unknown"), None
+
+
+def _format_clock(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%H:%M")
+
+
+def _soothing_episode_lines(events: list[tuple[int, str]], end_ms: int) -> list[str]:
+    """One notes line per contiguous run of soothing states (LEVEL1-4), e.g.
+    "- Soothing episode 1: 17:26-17:28 (Level1, 2m 17s)", so individual
+    soothing bouts are visible alongside the aggregate Soothing/LevelN totals
+    (which only show combined time across the whole session)."""
+    lines: list[str] = []
+    episode_start: int | None = None
+    episode_levels: list[str] = []
+    count = 0
+
+    def close_episode(episode_end_ms: int) -> None:
+        nonlocal count
+        count += 1
+        dur = (episode_end_ms - episode_start) / 1000
+        lines.append(
+            f"- Soothing episode {count}: {_format_clock(episode_start)}-{_format_clock(episode_end_ms)} "
+            f"({'→'.join(episode_levels)}, {fmt_dur(dur)})"
+        )
+
+    for t_ms, state in events:
+        is_soothing = state.upper() in _SOOTHING_STATES
+        if is_soothing:
+            if episode_start is None:
+                episode_start = t_ms
+                episode_levels = []
+            label = state.capitalize()
+            if not episode_levels or episode_levels[-1] != label:
+                episode_levels.append(label)
+        elif episode_start is not None:
+            close_episode(t_ms)
+            episode_start = None
+
+    if episode_start is not None:
+        close_episode(end_ms)
+
+    return lines
 
 
 def _infer_wake_reason(events: list[tuple[int, str]], closing_data: SnooData) -> str | None:
@@ -149,9 +192,10 @@ class LiveSessionTracker:
                     segments.append((sub_label, dur))
 
             asleep_s, soothing_s, other = aggregate_segment_durations(segments)
+            episode_lines = _soothing_episode_lines(events, end_ms)
             wake_reason = _infer_wake_reason(events, closing_data)
-            extra_lines = [f"- Ended: {wake_reason}"] if wake_reason else None
-            notes = format_session_notes(asleep_s, soothing_s, other, extra_lines=extra_lines)
+            extra_lines = episode_lines + ([f"- Ended: {wake_reason}"] if wake_reason else [])
+            notes = format_session_notes(asleep_s, soothing_s, other, extra_lines=extra_lines or None)
 
             completed.append(SnooCompletedSession(
                 session_id=session_id,
