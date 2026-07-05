@@ -16,10 +16,11 @@ There are no tests or linter configs in this project.
 
 ## Architecture
 
-**Flow:** `runner` dispatches to one of two modes based on `SNOO_PREMIUM`, gets back completed sessions, checks them against `dedupe` (SQLite), then `huckleberry_sink` writes missing sessions to Huckleberry Firestore using deterministic document IDs based on SNOO `session_id`.
+**Flow:** `runner` dispatches to one of three modes based on `SNOO_MODE`, gets back completed sessions, checks them against `dedupe` (SQLite), then `huckleberry_sink` writes missing sessions to Huckleberry Firestore using deterministic document IDs based on SNOO `session_id`.
 
-- **Premium mode** (`SNOO_PREMIUM=true`): `snoo_source.fetch_past_sessions` calls `/ss/me/v11/babies/{baby_id}/sessions/daily` to get full session history with a soothing/asleep duration breakdown. **This endpoint requires an active SNOO Premium subscription** — without one it returns `200` with empty `levels: []` regardless of what actually happened on the device, which silently produces zero sessions every pass (confirmed 2026-07-04).
-- **Basic/non-premium mode** (`SNOO_PREMIUM=false`, default): `snoo_source.fetch_device_state` polls `/hds/me/v11/devices` for live `activityState.state_machine` and the runner reconstructs completed sessions by tracking `is_active_session` transitions across successive polls (start recorded when a new `session_id` goes active, end recorded from the last poll where it was still active). No soothing/asleep breakdown is available this way — only total duration.
+- **Live mode** (`SNOO_MODE=live`, default): `snoo_source.start_live_subscription` opens a persistent AWS IoT MQTT push subscription (the same mechanism the official Home Assistant SNOO integration uses - confirmed by reading its source). `runner._run_live()` never returns; `live_source.LiveSessionTracker` reconstructs completed sessions from real-time state transitions (persisted to SQLite as they arrive, so a restart mid-session resumes rather than loses data), giving a minute-level asleep/soothing/other-state breakdown plus a best-effort wake-reason guess - all without needing SNOO Premium. `--loop` is ignored in this mode since the connection itself never returns.
+- **Basic mode** (`SNOO_MODE=basic`): polls `/hds/me/v11/devices` every `INTERVAL_MINUTES` and reconstructs sessions from `is_active_session` transitions across polls (kept as a fallback). No breakdown, only total duration.
+- **Premium mode** (`SNOO_MODE=premium`): `snoo_source.fetch_past_sessions` calls `/ss/me/v11/babies/{baby_id}/sessions/daily` for full session history with a soothing/asleep breakdown. **Requires an active SNOO Premium subscription** - without one it returns `200` with empty `levels: []` regardless of real activity (confirmed 2026-07-04).
 
 ### Module responsibilities
 
@@ -27,10 +28,11 @@ There are no tests or linter configs in this project.
 |---|---|
 | `sync/config.py` | Loads all env vars at import time; raises on missing required vars |
 | `sync/ssl_helper.py` | Automatically exports Windows root certificates to PEM for gRPC and provides custom SSL Context |
-| `sync/snoo_source.py` | Authenticates with `python-snoo`; `fetch_past_sessions` (premium, history endpoint) and `fetch_device_state` (non-premium, live device polling) |
-| `sync/dedupe.py` | SQLite store with two tables: `written_sessions` (permanent, already-synced seen-cache) and `active_sessions` (transient, in-progress session tracking used only in non-premium mode) |
+| `sync/snoo_source.py` | Authenticates with `python-snoo`; `fetch_past_sessions` (premium), `fetch_device_state` (basic polling), `start_live_subscription` (live MQTT push); shared `aggregate_segment_durations`/`format_session_notes` helpers |
+| `sync/dedupe.py` | SQLite store with three tables: `written_sessions` (permanent seen-cache), `active_sessions` (transient, basic-mode in-progress tracking), `live_session_events` (transient, live-mode per-transition event log) |
+| `sync/live_source.py` | `LiveSessionTracker` - pure session-reconstruction logic from live MQTT events, no network/Firestore I/O |
 | `sync/huckleberry_sink.py` | Authenticates with `huckleberry-api`, writes sleep intervals with details and location to Firestore and updates `prefs.lastSleep` |
-| `sync/runner.py` | Orchestrates one pass or a timed loop; branches into `_run_once_premium` or `_run_once_basic` per `SNOO_PREMIUM` |
+| `sync/runner.py` | Orchestrates one pass or a timed loop; branches into `_run_live`, `_run_once_basic`, or `_run_once_premium` per `SNOO_MODE` |
 | `sync/find_child_uids.py` | Utility script to query and display SNOO and Huckleberry child IDs |
 
 ### Key design details
@@ -50,4 +52,4 @@ The SQLite file (`DB_PATH`, default `/data/dedupe.sqlite`) must be on a persiste
 
 ### Unofficial APIs & Databases
 
-SNOO uses reverse-engineered API endpoints (via `python-snoo`, calling `/ss/me/v11/babies/{baby_id}/sessions/daily` in premium mode or `/hds/me/v11/devices` in basic mode — neither is part of the `python-snoo` library itself). Huckleberry sleep intervals are written directly to Huckleberry's Google Firebase Firestore database using the official Google Cloud Firestore SDK. Changes in either platform's backend structure can silently break this tool.
+SNOO uses reverse-engineered API endpoints (via `python-snoo`, calling `/ss/me/v11/babies/{baby_id}/sessions/daily` in premium mode, `/hds/me/v11/devices` in basic mode, or AWS IoT MQTT in live mode — the HTTP endpoints are not part of the `python-snoo` library itself). Huckleberry sleep intervals are written directly to Huckleberry's Google Firebase Firestore database using the official Google Cloud Firestore SDK. Changes in either platform's backend structure can silently break this tool.
