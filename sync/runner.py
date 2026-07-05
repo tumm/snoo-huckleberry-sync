@@ -18,6 +18,7 @@ from typing import Callable
 
 
 import aiohttp
+from python_snoo.containers import SnooData
 
 # Run Windows gRPC SSL setup before importing packages that use gRPC
 from .ssl_helper import get_ssl_context, setup_grpc_ssl
@@ -26,7 +27,8 @@ setup_grpc_ssl()
 from . import config
 from .dedupe import DedupeStore
 from .huckleberry_sink import make_huckleberry_client, resolve_child_uid, write_sleep_interval
-from .snoo_source import fetch_past_sessions, fetch_device_state, SnooCompletedSession
+from .live_source import LiveSessionTracker
+from .snoo_source import fetch_past_sessions, fetch_device_state, start_live_subscription, SnooCompletedSession
 
 logging.basicConfig(
     level=logging.INFO,
@@ -213,10 +215,85 @@ async def _run_once_basic(session: aiohttp.ClientSession, store: DedupeStore, dr
     )
 
 
+async def _write_one_live_session(
+    store: DedupeStore,
+    hb,
+    child_uid: str | None,
+    sess: SnooCompletedSession,
+    dry: bool,
+) -> None:
+    if dry:
+        log.info(
+            "  WOULD WRITE: %s -> %s  (%.1f min)\nNotes:\n%s",
+            sess.start.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            sess.end.strftime("%H:%M:%S UTC"),
+            sess.total_seconds / 60,
+            sess.notes,
+        )
+        return
+
+    if store.seen(sess.session_id):
+        log.debug("Live session %s already written, skipping.", sess.session_id)
+        return
+
+    await write_sleep_interval(hb, child_uid, sess)
+    store.mark(sess.session_id, sess.start, sess.end)
+    log.info("Live session %s written to Huckleberry.", sess.session_id)
+
+
+async def _run_live() -> None:
+    """Persistent live mode: never returns. Listens to AWS IoT MQTT push
+    events and writes completed sessions to Huckleberry as they close,
+    instead of waiting for a poll interval."""
+    dry = config.DRY_RUN
+    log.info("Starting live mode (DRY_RUN=%s) - persistent MQTT session tracking.", dry)
+
+    store = DedupeStore(config.DB_PATH)
+    tracker = LiveSessionTracker(store, _MIN_SESSION_SECONDS)
+
+    import os
+    connector = aiohttp.TCPConnector(ssl=False) if os.name == "nt" else None
+    async with aiohttp.ClientSession(connector=connector) as session:
+        hb = None
+        child_uid = None
+        if not dry:
+            hb = await make_huckleberry_client(
+                session, config.HUCKLEBERRY_EMAIL, config.HUCKLEBERRY_PASSWORD, config.HUCKLEBERRY_TIMEZONE,
+            )
+            child_uid = await resolve_child_uid(hb, config.HUCKLEBERRY_CHILD_UID)
+
+        def on_message(data: SnooData) -> None:
+            try:
+                completed = tracker.handle_event(data)
+            except Exception:
+                log.error("Error handling live event, dropping it.", exc_info=True)
+                return
+            for sess in completed:
+                asyncio.create_task(_write_one_live_session(store, hb, child_uid, sess, dry))
+
+        snoo, device = await start_live_subscription(
+            session, config.SNOO_USERNAME, config.SNOO_PASSWORD, on_message
+        )
+
+        # Heartbeat + resubscribe watchdog. python-snoo doesn't expose a public
+        # "is this subscription alive" API, so this reaches into its internal
+        # _mqtt_tasks map - fragile if the library restructures, but there's no
+        # supported alternative and the cost of missing a dead connection in an
+        # unattended Portainer deployment is silent, indefinite data loss.
+        heartbeat_s = config.INTERVAL_MINUTES * 60
+        while True:
+            await asyncio.sleep(heartbeat_s)
+            task = snoo._mqtt_tasks.get(device.serialNumber)
+            if task is None or task.done():
+                log.warning("Live MQTT subscription for %s is not running - resubscribing.", device.serialNumber)
+                snoo.start_subscribe(device, on_message)
+            else:
+                log.info("Live mode heartbeat: MQTT subscription alive for %s.", device.serialNumber)
+
+
 async def run_once() -> None:
     dry = config.DRY_RUN
-    mode = "premium" if config.SNOO_PREMIUM else "basic (device-polling)"
-    log.info("Starting sync pass (DRY_RUN=%s, mode=%s, interval=%.0fmin)", dry, mode, config.INTERVAL_MINUTES)
+    log.info("Starting sync pass (DRY_RUN=%s, mode=%s, interval=%.0fmin)", dry, config.SNOO_MODE, config.INTERVAL_MINUTES)
 
     store = DedupeStore(config.DB_PATH)
 
@@ -224,7 +301,7 @@ async def run_once() -> None:
     connector = aiohttp.TCPConnector(ssl=False) if os.name == "nt" else None
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
-            if config.SNOO_PREMIUM:
+            if config.SNOO_MODE == "premium":
                 await _run_once_premium(session, store, dry)
             else:
                 await _run_once_basic(session, store, dry)
@@ -250,7 +327,9 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        if args.loop:
+        if config.SNOO_MODE == "live":
+            asyncio.run(_run_live())
+        elif args.loop:
             asyncio.run(run_loop())
         else:
             asyncio.run(run_once())
