@@ -28,6 +28,10 @@ log = logging.getLogger(__name__)
 _ASLEEP_STATES = {"BASELINE", "WEANING_BASELINE"}
 _SOOTHING_STATES = {"LEVEL1", "LEVEL2", "LEVEL3", "LEVEL4"}
 
+# Grace period added to a stale (missed-close) session's last-recorded event
+# timestamp when bounding its fabricated end time - see _close_open_sessions.
+_STALE_SESSION_GRACE_MS = 10 * 60 * 1000  # 10 minutes
+
 
 def _classify_state(state: str) -> tuple[str, str | None]:
     """Map a raw device state to (aggregation bucket label, optional individual
@@ -73,6 +77,13 @@ class LiveSessionTracker:
         state = str(data.state_machine.state)
         existing = self._store.get_live_events(session_id)
         if not existing:
+            # Note: if this is actually a mid-session seed (process started or
+            # reconnected while a session was already in progress), the entire
+            # pre-seed span gets attributed to whatever single state is present
+            # at seed time - an approximation, since we have no record of any
+            # state transitions that happened before we started observing.
+            # Steady-state sessions that begin while the process is already
+            # running and connected are unaffected.
             start_ms = back_compute_start_ms(
                 data.event_time_ms, data.state_machine.since_session_start_ms
             )
@@ -90,7 +101,8 @@ class LiveSessionTracker:
 
     def _close_open_sessions(self, closing_data: SnooData) -> list[SnooCompletedSession]:
         completed: list[SnooCompletedSession] = []
-        for session_id in self._store.open_live_session_ids():
+        open_ids = self._store.open_live_session_ids()
+        for i, session_id in enumerate(open_ids):
             events = self._store.get_live_events(session_id)
             self._store.clear_live_events(session_id)
 
@@ -99,15 +111,37 @@ class LiveSessionTracker:
                 continue
 
             start_ms = events[0][0]
-            end_ms = closing_data.event_time_ms
+            # open_live_session_ids() returns oldest-opened-first, so only the
+            # LAST entry can plausibly be the session that actually triggered
+            # this closing event. Any earlier open session_ids only exist
+            # because their real close was missed (e.g. during a connection
+            # outage covered by the resubscribe watchdog) - attributing this
+            # closing event's timestamp to them could fabricate a wildly wrong,
+            # multi-hour-long session. Instead, bound a stale session's end
+            # time at its own last-recorded event timestamp plus a grace
+            # period, producing a plausible-but-imperfect duration rather than
+            # a bogus one.
+            is_most_recent = (i == len(open_ids) - 1)
+            if is_most_recent:
+                end_ms = closing_data.event_time_ms
+            else:
+                last_recorded_ms = events[-1][0]
+                end_ms = min(closing_data.event_time_ms, last_recorded_ms + _STALE_SESSION_GRACE_MS)
+                log.warning(
+                    "Live session %s appears stale (missed its real close, likely "
+                    "during a connection outage) - closing at last-seen time + grace "
+                    "instead of the current closing event's timestamp.",
+                    session_id,
+                )
+
             total_seconds = (end_ms - start_ms) / 1000
             if total_seconds < self._min_session_seconds:
                 log.info("Live session %s too short (%.0fs) - discarding.", session_id, total_seconds)
                 continue
 
             segments: list[tuple[str, float]] = []
-            for i, (t_ms, state) in enumerate(events):
-                next_ms = events[i + 1][0] if i + 1 < len(events) else end_ms
+            for j, (t_ms, state) in enumerate(events):
+                next_ms = events[j + 1][0] if j + 1 < len(events) else end_ms
                 dur = (next_ms - t_ms) / 1000
                 bucket_label, sub_label = _classify_state(state)
                 segments.append((bucket_label, dur))

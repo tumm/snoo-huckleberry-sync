@@ -60,4 +60,10 @@ def _choice(key: str, default: str, choices: set[str]) -> str:
     return raw
 
 
+if os.environ.get("SNOO_PREMIUM") is not None and os.environ.get("SNOO_MODE") is None:
+    raise RuntimeError(
+        "SNOO_PREMIUM is deprecated and no longer used. Set SNOO_MODE=premium, "
+        "SNOO_MODE=basic, or SNOO_MODE=live (recommended) in .env instead."
+    )
+
 SNOO_MODE: str = _choice("SNOO_MODE", "live", _VALID_SNOO_MODES)

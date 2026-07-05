@@ -280,6 +280,12 @@ async def _run_live() -> None:
             )
             child_uid = await resolve_child_uid(hb, config.HUCKLEBERRY_CHILD_UID)
 
+        # Strong references to fire-and-forget write tasks - asyncio.Task only
+        # holds a weak reference internally, so without this a task can be
+        # garbage-collected mid-flight, silently dropping a write with no
+        # error logged at all.
+        _pending_writes: set[asyncio.Task] = set()
+
         def on_message(data: SnooData) -> None:
             try:
                 completed = tracker.handle_event(data)
@@ -287,7 +293,9 @@ async def _run_live() -> None:
                 log.error("Error handling live event, dropping it.", exc_info=True)
                 return
             for sess in completed:
-                asyncio.create_task(_write_one_live_session(store, hb, child_uid, sess, dry))
+                task = asyncio.create_task(_write_one_live_session(store, hb, child_uid, sess, dry))
+                _pending_writes.add(task)
+                task.add_done_callback(_pending_writes.discard)
 
         snoo, device = await start_live_subscription(
             session, config.SNOO_USERNAME, config.SNOO_PASSWORD, on_message
@@ -305,6 +313,21 @@ async def _run_live() -> None:
             if task is None or task.done():
                 log.warning("Live MQTT subscription for %s is not running - resubscribing.", device.serialNumber)
                 snoo.start_subscribe(device, on_message)
+                # Re-seed a fresh read of the device's actual current session_id as
+                # soon as possible after reconnecting, rather than waiting for the
+                # next organic transition - otherwise a session that was open before
+                # the connection dropped never gets closed until some unrelated
+                # future session's closing event arrives (see
+                # LiveSessionTracker._close_open_sessions's stale-session handling).
+                try:
+                    await snoo.get_status(device)
+                except Exception:
+                    log.warning(
+                        "Post-resubscribe device status request for %s failed or "
+                        "timed out; will pick up state on the next real transition.",
+                        device.serialNumber,
+                        exc_info=True,
+                    )
             else:
                 log.info("Live mode heartbeat: MQTT subscription alive for %s.", device.serialNumber)
 

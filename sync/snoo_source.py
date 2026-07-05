@@ -209,7 +209,16 @@ async def start_live_subscription(
     log.info("Live mode tracking device %s (%s)", device.serialNumber, device.name)
 
     snoo.start_subscribe(device, on_message)
-    await snoo.get_status(device)
+    try:
+        await snoo.get_status(device)
+    except Exception:
+        log.warning(
+            "Initial device status request for %s failed or timed out; the live "
+            "subscription is still active and will pick up state on the next "
+            "real transition.",
+            device.serialNumber,
+            exc_info=True,
+        )
     return snoo, device
 
 
