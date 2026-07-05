@@ -42,7 +42,7 @@ _MIN_SESSION_SECONDS = config.MIN_SESSION_MINUTES * 60  # ignore sessions shorte
 
 _NO_BREAKDOWN_NOTES = (
     "SNOO Sleep Session (basic tracking - total duration only).\n"
-    "Enable SNOO_PREMIUM in .env for an asleep/soothing breakdown once subscribed."
+    "Set SNOO_MODE=premium or SNOO_MODE=live in .env for an asleep/soothing breakdown."
 )
 
 
@@ -236,9 +236,27 @@ async def _write_one_live_session(
         log.debug("Live session %s already written, skipping.", sess.session_id)
         return
 
-    await write_sleep_interval(hb, child_uid, sess)
-    store.mark(sess.session_id, sess.start, sess.end)
-    log.info("Live session %s written to Huckleberry.", sess.session_id)
+    # This runs as a fire-and-forget asyncio.create_task from on_message, with no
+    # caller left to see an exception - by the time this session reaches here its
+    # source events are already cleared from SQLite (LiveSessionTracker's job is
+    # done), so a failure here means the reconstructed session data is gone for
+    # good unless it's at least logged loudly for a human to notice and recover
+    # manually (e.g. from these log lines) rather than vanishing into asyncio's
+    # generic "Task exception was never retrieved" warning.
+    try:
+        await write_sleep_interval(hb, child_uid, sess)
+        store.mark(sess.session_id, sess.start, sess.end)
+        log.info("Live session %s written to Huckleberry.", sess.session_id)
+    except Exception:
+        log.error(
+            "Failed to write live session %s to Huckleberry - this session's data is "
+            "now lost (source events already cleared). start=%s end=%s notes:\n%s",
+            sess.session_id,
+            sess.start.isoformat(),
+            sess.end.isoformat(),
+            sess.notes,
+            exc_info=True,
+        )
 
 
 async def _run_live() -> None:
