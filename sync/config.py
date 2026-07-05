@@ -50,4 +50,14 @@ MIN_SESSION_MINUTES: int = _int("MIN_SESSION_MINUTES", 1)
 HUCKLEBERRY_SLEEP_LOCATION: str = os.environ.get("HUCKLEBERRY_SLEEP_LOCATION", "onOwnInBed")
 HISTORY_DAYS: int = _int("HISTORY_DAYS", 2)
 IN_PROGRESS_BUFFER_MINUTES: int = _int("IN_PROGRESS_BUFFER_MINUTES", 5)
-SNOO_PREMIUM: bool = _bool("SNOO_PREMIUM", False)
+_VALID_SNOO_MODES = {"premium", "basic", "live"}
+
+
+def _choice(key: str, default: str, choices: set[str]) -> str:
+    raw = os.environ.get(key, default)
+    if raw not in choices:
+        raise RuntimeError(f"Env var {key!r} must be one of {sorted(choices)}, got {raw!r}")
+    return raw
+
+
+SNOO_MODE: str = _choice("SNOO_MODE", "live", _VALID_SNOO_MODES)
