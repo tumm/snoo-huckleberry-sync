@@ -8,7 +8,7 @@ This tool can be run locally as a Python script, scheduled as a task/cron job, o
 
 There are three modes, set via `SNOO_MODE`:
 
-- **`live`** (default, recommended): opens a persistent real-time connection to your SNOO device (AWS IoT MQTT push events, the same mechanism the official [Home Assistant SNOO integration](https://www.home-assistant.io/integrations/snoo) uses). Every state change (asleep, soothing level 1-4, etc.) is captured the instant it happens, so as soon as a session ends it's reconstructed and written to Huckleberry immediately, with no polling delay. Works without a SNOO Premium subscription and gives a full minute-level breakdown: total asleep/soothing time, each individual soothing episode with its time range, and a best-effort guess at how the session ended (picked up, timed out, etc).
+- **`live`** (default, recommended): opens a persistent real-time connection to your SNOO device (AWS IoT MQTT push events, the same mechanism the official [Home Assistant SNOO integration](https://www.home-assistant.io/integrations/snoo) uses). Every state change (asleep, soothing level 1-4, etc.) is captured the instant it happens, so as soon as a session ends it's reconstructed and written to Huckleberry immediately, with no polling delay. Works without a SNOO Premium subscription. By default (`NOTES_DETAIL=summary`) the Huckleberry notes are a compact summary: total session length, total soothing time with how many soothing episodes occurred, and a best-effort guess at how the session ended (picked up, fuzzy wakeup, timed out, etc). Set `NOTES_DETAIL=detailed` for a full minute-level breakdown instead: total asleep/soothing time, each individual soothing episode with its time range.
 - **`basic`**: polls the SNOO device every `INTERVAL_MINUTES` and reconstructs sessions from state changes across polls. Works without Premium, but only reports total sleep duration (no asleep/soothing breakdown), and timestamps are only as precise as your poll interval. Useful as a fallback if `live` mode proves unreliable on your network.
 - **`premium`**: fetches full session history (with an asleep/soothing breakdown) from SNOO's own history API. **Requires an active SNOO Premium subscription**; without one, this endpoint silently returns no data.
 
@@ -102,6 +102,7 @@ volumes:
 | `HUCKLEBERRY_CHILD_UID`      | No       | auto-detected         | Override if auto-detection picks the wrong child   |
 | `HUCKLEBERRY_SLEEP_LOCATION` | No       | `onOwnInBed`          | Sleep location category tag                        |
 | `SNOO_MODE`                  | No       | `live`                | Detection mode: `live`, `basic`, or `premium` (see [How it works](#how-it-works)) |
+| `NOTES_DETAIL`               | No       | `summary`             | `live` mode only: `summary` (compact) or `detailed` (full per-level/per-episode breakdown) |
 | `INTERVAL_MINUTES`           | No       | `15`                  | In `basic`/`premium` mode: how often to poll the SNOO. In `live` mode: how often to check the connection is still alive and reconnect if not |
 | `MIN_SESSION_MINUTES`        | No       | `1`                   | Discard sleep sessions shorter than this threshold |
 | `HISTORY_DAYS`               | No       | `2`                   | `premium` mode only: number of days of SNOO history to sync |

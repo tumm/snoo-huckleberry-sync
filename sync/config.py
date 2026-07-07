@@ -67,3 +67,6 @@ if os.environ.get("SNOO_PREMIUM") is not None and os.environ.get("SNOO_MODE") is
     )
 
 SNOO_MODE: str = _choice("SNOO_MODE", "live", _VALID_SNOO_MODES)
+
+_VALID_NOTES_DETAIL = {"summary", "detailed"}
+NOTES_DETAIL: str = _choice("NOTES_DETAIL", "summary", _VALID_NOTES_DETAIL)

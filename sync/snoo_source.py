@@ -114,14 +114,50 @@ def format_session_notes(
     soothing_s: float,
     other: dict[str, float],
     extra_lines: list[str] | None = None,
+    *,
+    detailed: bool = True,
+    total_seconds: float | None = None,
+    soothing_episode_count: int | None = None,
 ) -> str:
+    """Render a SNOO session's Huckleberry notes field.
+
+    detailed=True (default) reproduces the original Asleep/Soothing/per-level
+    breakdown byte-for-byte - premium mode's fetch_past_sessions never passes
+    detailed=, so it keeps today's exact format with zero changes.
+
+    detailed=False (live mode's NOTES_DETAIL=summary, the new live-mode default)
+    renders a compact Total/Soothing(with episode count)/wake-reason summary.
+    Requires total_seconds - the true wall-clock session length, NOT derivable
+    as asleep_s + soothing_s + sum(other.values()): other may already double-count
+    soothing-level durations that are also folded into soothing_s (see
+    aggregate_segment_durations's per-level display labels) - callers must pass
+    the real total explicitly.
+    """
+    if detailed:
+        lines = [
+            "SNOO Sleep Session Summary:",
+            f"\n- Asleep: {fmt_dur(asleep_s)}",
+            f"\n- Soothing: {fmt_dur(soothing_s)}",
+        ]
+        for label, dur in sorted(other.items()):
+            lines.append(f"- {label.capitalize()}: {fmt_dur(dur)}")
+        if extra_lines:
+            lines.extend(extra_lines)
+        return "\n".join(lines)
+
+    if total_seconds is None:
+        raise ValueError("total_seconds is required when detailed=False")
+
+    soothing_line = f"- Soothing: {fmt_dur(soothing_s)}"
+    if soothing_episode_count:
+        noun = "episode" if soothing_episode_count == 1 else "episodes"
+        soothing_line += f" ({soothing_episode_count} {noun})"
+
     lines = [
         "SNOO Sleep Session Summary:",
-        f"\n- Asleep: {fmt_dur(asleep_s)}",
-        f"\n- Soothing: {fmt_dur(soothing_s)}",
+        f"- Total: {fmt_dur(total_seconds)}",
+        soothing_line,
     ]
-    for label, dur in sorted(other.items()):
-        lines.append(f"- {label.capitalize()}: {fmt_dur(dur)}")
     if extra_lines:
         lines.extend(extra_lines)
     return "\n".join(lines)

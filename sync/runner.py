@@ -267,7 +267,7 @@ async def _run_live() -> None:
     log.info("Starting live mode (DRY_RUN=%s) - persistent MQTT session tracking.", dry)
 
     store = DedupeStore(config.DB_PATH)
-    tracker = LiveSessionTracker(store, _MIN_SESSION_SECONDS)
+    tracker = LiveSessionTracker(store, _MIN_SESSION_SECONDS, config.NOTES_DETAIL)
 
     import os
     connector = aiohttp.TCPConnector(ssl=False) if os.name == "nt" else None

@@ -50,24 +50,19 @@ def _format_clock(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%H:%M")
 
 
-def _soothing_episode_lines(events: list[tuple[int, str]], end_ms: int) -> list[str]:
-    """One notes line per contiguous run of soothing states (LEVEL1-4), e.g.
-    "- Soothing episode 1: 17:26-17:28 (Level1, 2m 17s)", so individual
-    soothing bouts are visible alongside the aggregate Soothing/LevelN totals
-    (which only show combined time across the whole session)."""
-    lines: list[str] = []
+def _find_soothing_episodes(
+    events: list[tuple[int, str]], end_ms: int
+) -> list[tuple[int, int, list[str]]]:
+    """Contiguous runs of soothing states (LEVEL1-4) as (start_ms, end_ms,
+    level_labels) tuples. Shared by both _soothing_episode_lines (detailed mode)
+    and NOTES_DETAIL=summary's episode count, so the two never disagree about
+    what counts as an episode."""
+    episodes: list[tuple[int, int, list[str]]] = []
     episode_start: int | None = None
     episode_levels: list[str] = []
-    count = 0
 
     def close_episode(episode_end_ms: int) -> None:
-        nonlocal count
-        count += 1
-        dur = (episode_end_ms - episode_start) / 1000
-        lines.append(
-            f"- Soothing episode {count}: {_format_clock(episode_start)}-{_format_clock(episode_end_ms)} "
-            f"({'→'.join(episode_levels)}, {fmt_dur(dur)})"
-        )
+        episodes.append((episode_start, episode_end_ms, episode_levels))
 
     for t_ms, state in events:
         is_soothing = state.upper() in _SOOTHING_STATES
@@ -85,12 +80,35 @@ def _soothing_episode_lines(events: list[tuple[int, str]], end_ms: int) -> list[
     if episode_start is not None:
         close_episode(end_ms)
 
+    return episodes
+
+
+def _soothing_episode_lines(episodes: list[tuple[int, int, list[str]]]) -> list[str]:
+    """One notes line per soothing episode, e.g.
+    "- Soothing episode 1: 17:26-17:28 (Level1, 2m 17s)". Detailed mode only -
+    summary mode uses len(episodes) as a plain count instead."""
+    lines: list[str] = []
+    for i, (start_ms, ep_end_ms, levels) in enumerate(episodes, start=1):
+        dur = (ep_end_ms - start_ms) / 1000
+        lines.append(
+            f"- Soothing episode {i}: {_format_clock(start_ms)}-{_format_clock(ep_end_ms)} "
+            f"({'→'.join(levels)}, {fmt_dur(dur)})"
+        )
     return lines
 
 
 def _infer_wake_reason(events: list[tuple[int, str]], closing_data: SnooData) -> str | None:
     """Best-effort guess at how the session ended, from the closing push event.
-    Unvalidated against real sessions - expect to refine after real data lands."""
+    Unvalidated against real sessions - expect to refine after real data lands.
+
+    Priority (most to least certain): safety-clip release (unambiguous,
+    device-confirmed pickup) > terminal device states TIMEOUT/SUSPENDED (also
+    unambiguous, mutually exclusive with each other and the soothing check below
+    since last_state can only hold one value) > last recorded state still an
+    active soothing level with no clip release seen (SNOO was still actively
+    soothing when the session closed - a fuzzy wakeup) > the CRY event fallback
+    (weakest signal, a single closing-event field rather than a state judgment).
+    """
     last_state = events[-1][1].upper() if events else ""
     if closing_data.left_safety_clip == 0 or closing_data.right_safety_clip == 0:
         return "Picked up out of SNOO"
@@ -98,6 +116,8 @@ def _infer_wake_reason(events: list[tuple[int, str]], closing_data: SnooData) ->
         return "Soothing timed out without settling"
     if last_state == "SUSPENDED":
         return "Session stopped manually"
+    if last_state in _SOOTHING_STATES:
+        return "Fuzzy wakeup"
     if closing_data.event == SnooEvents.CRY:
         return "Ended after sustained crying"
     return None
@@ -108,9 +128,10 @@ class LiveSessionTracker:
     each state transition to SQLite as it arrives so a process restart
     mid-session resumes from the persisted events instead of losing them."""
 
-    def __init__(self, store: DedupeStore, min_session_seconds: float) -> None:
+    def __init__(self, store: DedupeStore, min_session_seconds: float, notes_detail: str) -> None:
         self._store = store
         self._min_session_seconds = min_session_seconds
+        self._notes_detail = notes_detail
 
     def handle_event(self, data: SnooData) -> list[SnooCompletedSession]:
         session_id = str(data.state_machine.session_id)
@@ -192,10 +213,23 @@ class LiveSessionTracker:
                     segments.append((sub_label, dur))
 
             asleep_s, soothing_s, other = aggregate_segment_durations(segments)
-            episode_lines = _soothing_episode_lines(events, end_ms)
+            episodes = _find_soothing_episodes(events, end_ms)
             wake_reason = _infer_wake_reason(events, closing_data)
-            extra_lines = episode_lines + ([f"- Ended: {wake_reason}"] if wake_reason else [])
-            notes = format_session_notes(asleep_s, soothing_s, other, extra_lines=extra_lines or None)
+            wake_line = [f"- Ended: {wake_reason}"] if wake_reason else []
+
+            if self._notes_detail == "detailed":
+                extra_lines = _soothing_episode_lines(episodes) + wake_line
+                notes = format_session_notes(
+                    asleep_s, soothing_s, other, extra_lines=extra_lines or None, detailed=True,
+                )
+            else:
+                notes = format_session_notes(
+                    asleep_s, soothing_s, other,
+                    extra_lines=wake_line or None,
+                    detailed=False,
+                    total_seconds=total_seconds,
+                    soothing_episode_count=len(episodes),
+                )
 
             completed.append(SnooCompletedSession(
                 session_id=session_id,
