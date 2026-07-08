@@ -10,25 +10,38 @@ Or in a loop (Docker entrypoint):
 
 import argparse
 import asyncio
+import contextlib
 import logging
+import signal
 import sys
 import time
-from datetime import datetime, timezone, timedelta
-from typing import Callable
-
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 
 import aiohttp
 from python_snoo.containers import SnooData
 
 # Run Windows gRPC SSL setup before importing packages that use gRPC
-from .ssl_helper import get_ssl_context, setup_grpc_ssl
+from .ssl_helper import make_aiohttp_connector, setup_grpc_ssl
+
 setup_grpc_ssl()
 
-from . import config
-from .dedupe import DedupeStore
-from .huckleberry_sink import make_huckleberry_client, resolve_child_uid, write_sleep_interval
-from .live_source import LiveSessionTracker
-from .snoo_source import fetch_past_sessions, fetch_device_state, start_live_subscription, SnooCompletedSession
+from . import config  # noqa: E402
+from .dedupe import DedupeStore  # noqa: E402
+from .huckleberry_sink import (  # noqa: E402
+    make_huckleberry_client,
+    resolve_child_uid,
+    write_sleep_interval,
+)
+from .live_source import LiveSessionTracker  # noqa: E402
+from .models import SnooCompletedSession  # noqa: E402
+from .snoo_source import (  # noqa: E402
+    fetch_device_state,
+    fetch_past_sessions,
+    get_subscription_task,
+    resubscribe,
+    start_live_subscription,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -128,7 +141,7 @@ async def _run_once_premium(session: aiohttp.ClientSession, store: DedupeStore, 
 
         # Skip sessions that are in progress or ended too recently (using the configured buffer)
         # This ensures we only sync completed sleep sessions and don't cache premature durations.
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(UTC)
         if now_utc - sess.end < timedelta(minutes=config.IN_PROGRESS_BUFFER_MINUTES):
             log.info(
                 "Session %s is in progress or ended too recently (ended %s) - skipping for now.",
@@ -190,10 +203,10 @@ async def _run_once_basic(session: aiohttp.ClientSession, store: DedupeStore, dr
             store.close_active_session(session_id)
             continue
 
-        start_dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+        start_dt = datetime.fromtimestamp(start_ms / 1000, tz=UTC)
         # Use the last time we observed this session active as the end time.
         # In loop mode this is within one poll interval of the true end.
-        end_dt = datetime.fromtimestamp(last_event_ms / 1000, tz=timezone.utc)
+        end_dt = datetime.fromtimestamp(last_event_ms / 1000, tz=UTC)
         duration_s = (end_dt - start_dt).total_seconds()
 
         if duration_s < _MIN_SESSION_SECONDS:
@@ -243,34 +256,61 @@ async def _write_one_live_session(
     # good unless it's at least logged loudly for a human to notice and recover
     # manually (e.g. from these log lines) rather than vanishing into asyncio's
     # generic "Task exception was never retrieved" warning.
-    try:
-        await write_sleep_interval(hb, child_uid, sess)
-        store.mark(sess.session_id, sess.start, sess.end)
-        log.info("Live session %s written to Huckleberry.", sess.session_id)
-    except Exception:
-        log.error(
-            "Failed to write live session %s to Huckleberry - this session's data is "
-            "now lost (source events already cleared). start=%s end=%s notes:\n%s",
-            sess.session_id,
-            sess.start.isoformat(),
-            sess.end.isoformat(),
-            sess.notes,
-            exc_info=True,
-        )
+    # Retry transient failures (network blips, Firestore 503s) so a momentary
+    # outage doesn't lose a session permanently.
+    _MAX_WRITE_ATTEMPTS = 3
+    _WRITE_RETRY_BASE_DELAY = 2.0  # seconds; doubled per attempt
+    for attempt in range(1, _MAX_WRITE_ATTEMPTS + 1):
+        try:
+            await write_sleep_interval(hb, child_uid, sess)
+            store.mark(sess.session_id, sess.start, sess.end)
+            log.info("Live session %s written to Huckleberry.", sess.session_id)
+            return
+        except Exception:
+            if attempt < _MAX_WRITE_ATTEMPTS:
+                delay = _WRITE_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                log.warning(
+                    "Write attempt %d/%d for live session %s failed - retrying in %.0fs.",
+                    attempt, _MAX_WRITE_ATTEMPTS, sess.session_id, delay,
+                    exc_info=True,
+                )
+                await asyncio.sleep(delay)
+                continue
+            log.error(
+                "Failed to write live session %s to Huckleberry after %d attempts - this "
+                "session's data is now lost (source events already cleared). "
+                "start=%s end=%s notes:\n%s",
+                sess.session_id,
+                _MAX_WRITE_ATTEMPTS,
+                sess.start.isoformat(),
+                sess.end.isoformat(),
+                sess.notes,
+                exc_info=True,
+            )
 
 
 async def _run_live() -> None:
     """Persistent live mode: never returns. Listens to AWS IoT MQTT push
     events and writes completed sessions to Huckleberry as they close,
-    instead of waiting for a poll interval."""
+    instead of waiting for a poll interval.
+
+    On SIGTERM/SIGINT (e.g. `docker stop`), drains in-flight write tasks and
+    closes the SQLite store so no events are lost and the file isn't left
+    with a half-written WAL."""
     dry = config.DRY_RUN
     log.info("Starting live mode (DRY_RUN=%s) - persistent MQTT session tracking.", dry)
 
     store = DedupeStore(config.DB_PATH)
+    try:
+        await _run_live_loop(store, dry)
+    finally:
+        store.close()
+
+
+async def _run_live_loop(store: DedupeStore, dry: bool) -> None:
     tracker = LiveSessionTracker(store, _MIN_SESSION_SECONDS, config.NOTES_DETAIL)
 
-    import os
-    connector = aiohttp.TCPConnector(ssl=False) if os.name == "nt" else None
+    connector = make_aiohttp_connector()
     async with aiohttp.ClientSession(connector=connector) as session:
         hb = None
         child_uid = None
@@ -307,12 +347,27 @@ async def _run_live() -> None:
         # supported alternative and the cost of missing a dead connection in an
         # unattended Portainer deployment is silent, indefinite data loss.
         heartbeat_s = config.INTERVAL_MINUTES * 60
-        while True:
-            await asyncio.sleep(heartbeat_s)
-            task = snoo._mqtt_tasks.get(device.serialNumber)
+
+        # Graceful shutdown: stop the heartbeat as soon as SIGTERM/SIGINT arrives
+        # so we can drain pending writes before the process is torn down.
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, RuntimeError):
+                loop.add_signal_handler(sig, stop_event.set)
+
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=heartbeat_s)
+                # stop_event was set during the wait - exit the loop
+                break
+            except TimeoutError:
+                pass  # heartbeat interval elapsed - run the watchdog
+
+            task = get_subscription_task(snoo, device)
             if task is None or task.done():
                 log.warning("Live MQTT subscription for %s is not running - resubscribing.", device.serialNumber)
-                snoo.start_subscribe(device, on_message)
+                resubscribe(snoo, device, on_message)
                 # Re-seed a fresh read of the device's actual current session_id as
                 # soon as possible after reconnecting, rather than waiting for the
                 # next organic transition - otherwise a session that was open before
@@ -331,6 +386,24 @@ async def _run_live() -> None:
             else:
                 log.info("Live mode heartbeat: MQTT subscription alive for %s.", device.serialNumber)
 
+        # Graceful shutdown: drain in-flight write tasks so a SIGTERM during a
+        # write doesn't lose the session. Best-effort with a bounded wait so a
+        # hung write can't block container shutdown indefinitely.
+        if _pending_writes:
+            log.info("Shutdown: draining %d pending write task(s)...", len(_pending_writes))
+            done, pending = await asyncio.wait(_pending_writes, timeout=30.0)
+            if pending:
+                log.warning(
+                    "Shutdown: %d write task(s) did not finish within 30s - cancelling.",
+                    len(pending),
+                )
+                for t in pending:
+                    t.cancel()
+        try:
+            await snoo.disconnect()
+        except Exception:
+            log.warning("Shutdown: error disconnecting SNOO MQTT client.", exc_info=True)
+
 
 async def run_once() -> None:
     dry = config.DRY_RUN
@@ -338,8 +411,7 @@ async def run_once() -> None:
 
     store = DedupeStore(config.DB_PATH)
 
-    import os
-    connector = aiohttp.TCPConnector(ssl=False) if os.name == "nt" else None
+    connector = make_aiohttp_connector()
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
             if config.SNOO_MODE == "premium":

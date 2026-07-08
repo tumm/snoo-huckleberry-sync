@@ -9,10 +9,10 @@ uv sync                                      # install / sync dependencies
 uv run python -m sync.runner                 # single poll pass
 uv run python -m sync.runner --loop          # continuous polling (Docker entrypoint)
 uv run python -m sync.find_child_uids        # print SNOO & Huckleberry child IDs
+uv run pytest                                # run tests
+uv run ruff check sync/ tests/               # lint
 docker build -t snoo-huckleberry-sync .      # build image
 ```
-
-There are no tests or linter configs in this project.
 
 ## Architecture
 
@@ -39,7 +39,7 @@ There are no tests or linter configs in this project.
 
 - **Windows Corporate Proxy / SSL Bypass**: On Windows, the runner automatically exports system certificates for gRPC to avoid handshake verification issues. Standard HTTPS queries (`aiohttp`) automatically fall back to `ssl=False` on Windows.
 - **Configurable Session Thresholds**: `MIN_SESSION_MINUTES` (configured in `.env`, defaults to 1) specifies the threshold below which SNOO sessions are classified as false starts/noise and discarded.
-- **Deterministic ID Enforced Idempotency**: The Huckleberry Firestore document ID (`interval_id`) is generated as a deterministic MD5 hash of the SNOO `session_id`. This guarantees Firestore-level deduplication even if the local database is lost.
+- **Deterministic ID Enforced Idempotency**: The Huckleberry Firestore document ID (`interval_id`) is generated as a deterministic SHA-256 hash of the SNOO `session_id` (truncated to 16 hex chars / 64 bits). This guarantees Firestore-level deduplication even if the local database is lost.
 - **Sleep Quality Tracking**: SNOO session levels are aggregated to calculate baseline vs. soothing durations, which are automatically formatted and written to Huckleberry's `notes` field (compact summary or full breakdown depending on `NOTES_DETAIL` in live mode).
 - **Sleep Metadata**: Sleep sessions are automatically enriched with locations (`sleepLocations` configured to `onOwnInBed=True`).
 - **Local DB Seen-Cache**: `DedupeStore.seen()` guards against redundant Huckleberry Firestore writes to avoid hitting rate limits or Firestore write quotas.

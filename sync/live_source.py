@@ -11,13 +11,13 @@ SnooDeviceState convention.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from python_snoo.containers import SnooData, SnooEvents
 
 from .dedupe import DedupeStore
+from .models import SnooCompletedSession
 from .snoo_source import (
-    SnooCompletedSession,
     aggregate_segment_durations,
     back_compute_start_ms,
     fmt_dur,
@@ -47,7 +47,7 @@ def _classify_state(state: str) -> tuple[str, str | None]:
 
 
 def _format_clock(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%H:%M")
+    return datetime.fromtimestamp(ms / 1000, tz=UTC).strftime("%H:%M")
 
 
 def _find_soothing_episodes(
@@ -157,9 +157,28 @@ class LiveSessionTracker:
             log.info(
                 "Tracking new live SNOO session %s (started %s)",
                 session_id,
-                datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat(),
+                datetime.fromtimestamp(start_ms / 1000, tz=UTC).isoformat(),
             )
         else:
+            # Dedupe: after a reconnect python-snoo may re-deliver the last
+            # event we already persisted. Appending it again would create a
+            # zero-duration duplicate segment and inflate the segment list.
+            # The seed event uses back-computed start_ms (not data.event_time_ms),
+            # so check both candidates against the stored rows.
+            existing_keys = set(existing)
+            is_seed_dup = (
+                (data.event_time_ms, state) in existing_keys
+                or (
+                    data.state_machine.since_session_start_ms is not None
+                    and data.state_machine.since_session_start_ms >= 0
+                    and (back_compute_start_ms(
+                        data.event_time_ms, data.state_machine.since_session_start_ms
+                    ), state) in existing_keys
+                )
+            )
+            if is_seed_dup:
+                log.debug("Live event for session %s already recorded - dropping duplicate.", session_id)
+                return []
             self._store.append_live_event(session_id, data.event_time_ms, state)
         return []
 
@@ -233,8 +252,8 @@ class LiveSessionTracker:
 
             completed.append(SnooCompletedSession(
                 session_id=session_id,
-                start=datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc),
-                end=datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc),
+                start=datetime.fromtimestamp(start_ms / 1000, tz=UTC),
+                end=datetime.fromtimestamp(end_ms / 1000, tz=UTC),
                 total_seconds=total_seconds,
                 notes=notes,
             ))
