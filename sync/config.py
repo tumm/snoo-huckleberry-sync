@@ -53,7 +53,7 @@ def _timezone(key: str, default: str) -> str:
     raw = os.environ.get(key, default)
     try:
         ZoneInfo(raw)
-    except ZoneInfoNotFoundError:
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
         raise RuntimeError(
             f"Env var {key!r} is not a valid IANA timezone, got {raw!r}. "
             f"Examples: 'America/New_York', 'Europe/London', 'UTC'."
@@ -70,7 +70,10 @@ HUCKLEBERRY_PASSWORD: str = _require("HUCKLEBERRY_PASSWORD")
 HUCKLEBERRY_TIMEZONE: str = _timezone("HUCKLEBERRY_TIMEZONE", "America/New_York")
 HUCKLEBERRY_CHILD_UID: str | None = os.environ.get("HUCKLEBERRY_CHILD_UID") or None
 
-INTERVAL_MINUTES: float = _float("INTERVAL_MINUTES", 15.0, min_value=1.0)
+# Only non-positive values are rejected - a zero or negative interval would
+# busy-loop run_loop's sleep and the live-mode heartbeat. No other floor is
+# justified, so sub-minute intervals are allowed if a deployment wants one.
+INTERVAL_MINUTES: float = _float("INTERVAL_MINUTES", 15.0, min_value=0.01)
 DRY_RUN: bool = _bool("DRY_RUN", False)
 DB_PATH: str = os.environ.get("DB_PATH", "/data/dedupe.sqlite")
 MIN_SESSION_MINUTES: int = _int("MIN_SESSION_MINUTES", 1, min_value=0)

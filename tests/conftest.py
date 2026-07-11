@@ -1,6 +1,19 @@
 """Shared test fixtures for building SnooData/SnooStateMachine objects."""
 
+import os
+
 from python_snoo.containers import SnooData, SnooEvents, SnooStateMachine, SnooStates
+
+# sync.config parses required env vars at import time (_require()). Set safe
+# placeholders via setdefault so tests that import sync.config/sync.runner/
+# sync.huckleberry_sink work in a fresh checkout without a real .env - this
+# never overrides a developer's real .env (dotenv.load_dotenv() already
+# defaults to override=False, and pytest loads conftest.py before any test
+# module import, so these run first either way).
+os.environ.setdefault("SNOO_USERNAME", "test@example.com")
+os.environ.setdefault("SNOO_PASSWORD", "test-password")
+os.environ.setdefault("HUCKLEBERRY_EMAIL", "test@example.com")
+os.environ.setdefault("HUCKLEBERRY_PASSWORD", "test-password")
 
 
 def make_state_machine(
