@@ -15,7 +15,7 @@ import logging
 import signal
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 import aiohttp
@@ -57,6 +57,43 @@ _NO_BREAKDOWN_NOTES = (
     "SNOO Sleep Session (basic tracking - total duration only).\n"
     "Set SNOO_MODE=premium or SNOO_MODE=live in .env for an asleep/soothing breakdown."
 )
+
+_MAX_WRITE_ATTEMPTS = 3
+_WRITE_RETRY_BASE_DELAY = 2.0  # seconds; doubled per attempt
+
+
+async def _retry_with_backoff[T](
+    coro_fn: Callable[[], Awaitable[T]],
+    *,
+    attempts: int = 3,
+    base_delay: float = 2.0,
+    should_abort: Callable[[], bool] | None = None,
+    on_retry: Callable[[int, float, Exception], None] | None = None,
+) -> T | None:
+    """Run `coro_fn()` up to `attempts` times with exponential backoff
+    (base_delay * 2**(attempt-1) seconds between attempts).
+
+    `should_abort`, if given, is re-checked at the START of every attempt
+    (including the first) - not just once before the loop - and short-circuits
+    with None if it returns True. This lets a caller detect "the work this
+    coroutine does already happened on a prior attempt" (e.g. via a durable
+    seen-cache) so a retry after a false-negative failure doesn't redo it.
+
+    Re-raises the last exception if every attempt fails.
+    """
+    for attempt in range(1, attempts + 1):
+        if should_abort is not None and should_abort():
+            return None
+        try:
+            return await coro_fn()
+        except Exception as exc:
+            if attempt >= attempts:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            if on_retry is not None:
+                on_retry(attempt, delay, exc)
+            await asyncio.sleep(delay)
+    return None  # unreachable; satisfies type checkers
 
 
 async def _write_batch(
@@ -249,6 +286,32 @@ async def _write_one_live_session(
         log.debug("Live session %s already written, skipping.", sess.session_id)
         return
 
+    async def _do_write() -> None:
+        await write_sleep_interval(hb, child_uid, sess)
+        store.mark(sess.session_id, sess.start, sess.end)
+        log.info("Live session %s written to Huckleberry.", sess.session_id)
+
+    def _already_written() -> bool:
+        # Re-checked before EVERY attempt, not just once before the loop: if a
+        # prior attempt's write actually succeeded (e.g. write_sleep_interval
+        # committed but the process died, or store.mark() itself raised, before
+        # this function returned), store.seen() is the source of truth that
+        # stops a retry from writing the same session to Huckleberry twice.
+        if store.seen(sess.session_id):
+            log.info(
+                "Live session %s was already written on a prior attempt - skipping retry.",
+                sess.session_id,
+            )
+            return True
+        return False
+
+    def _log_retry(attempt: int, delay: float, exc: Exception) -> None:
+        log.warning(
+            "Write attempt %d/%d for live session %s failed - retrying in %.0fs.",
+            attempt, _MAX_WRITE_ATTEMPTS, sess.session_id, delay,
+            exc_info=exc,
+        )
+
     # This runs as a fire-and-forget asyncio.create_task from on_message, with no
     # caller left to see an exception - by the time this session reaches here its
     # source events are already cleared from SQLite (LiveSessionTracker's job is
@@ -256,37 +319,26 @@ async def _write_one_live_session(
     # good unless it's at least logged loudly for a human to notice and recover
     # manually (e.g. from these log lines) rather than vanishing into asyncio's
     # generic "Task exception was never retrieved" warning.
-    # Retry transient failures (network blips, Firestore 503s) so a momentary
-    # outage doesn't lose a session permanently.
-    _MAX_WRITE_ATTEMPTS = 3
-    _WRITE_RETRY_BASE_DELAY = 2.0  # seconds; doubled per attempt
-    for attempt in range(1, _MAX_WRITE_ATTEMPTS + 1):
-        try:
-            await write_sleep_interval(hb, child_uid, sess)
-            store.mark(sess.session_id, sess.start, sess.end)
-            log.info("Live session %s written to Huckleberry.", sess.session_id)
-            return
-        except Exception:
-            if attempt < _MAX_WRITE_ATTEMPTS:
-                delay = _WRITE_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                log.warning(
-                    "Write attempt %d/%d for live session %s failed - retrying in %.0fs.",
-                    attempt, _MAX_WRITE_ATTEMPTS, sess.session_id, delay,
-                    exc_info=True,
-                )
-                await asyncio.sleep(delay)
-                continue
-            log.error(
-                "Failed to write live session %s to Huckleberry after %d attempts - this "
-                "session's data is now lost (source events already cleared). "
-                "start=%s end=%s notes:\n%s",
-                sess.session_id,
-                _MAX_WRITE_ATTEMPTS,
-                sess.start.isoformat(),
-                sess.end.isoformat(),
-                sess.notes,
-                exc_info=True,
-            )
+    try:
+        await _retry_with_backoff(
+            _do_write,
+            attempts=_MAX_WRITE_ATTEMPTS,
+            base_delay=_WRITE_RETRY_BASE_DELAY,
+            should_abort=_already_written,
+            on_retry=_log_retry,
+        )
+    except Exception:
+        log.error(
+            "Failed to write live session %s to Huckleberry after %d attempts - this "
+            "session's data is now lost (source events already cleared). "
+            "start=%s end=%s notes:\n%s",
+            sess.session_id,
+            _MAX_WRITE_ATTEMPTS,
+            sess.start.isoformat(),
+            sess.end.isoformat(),
+            sess.notes,
+            exc_info=True,
+        )
 
 
 async def _run_live() -> None:
