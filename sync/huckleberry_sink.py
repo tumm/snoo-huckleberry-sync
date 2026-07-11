@@ -6,6 +6,7 @@ import time
 
 import aiohttp
 from google.cloud.firestore_v1 import async_transactional
+from google.cloud.firestore_v1.async_transaction import AsyncTransaction
 from huckleberry_api import HuckleberryAPI
 from huckleberry_api.firebase_types import (
     FirebaseLastSleepData,
@@ -41,12 +42,20 @@ async def write_sleep_interval(
     child_uid: str,
     interval: SnooCompletedSession,
 ) -> None:
-    """Write one sleep interval to Firestore sleep/{child_uid}/intervals.
+    """Write one sleep interval to Firestore sleep/{child_uid}/intervals and update
+    prefs.lastSleep, both inside a single transaction.
 
-    The interval document is written unconditionally (its deterministic ID makes
-    it idempotent), then prefs.lastSleep is updated inside a transaction so that
-    two concurrent writes can't both read the old value and the loser silently
-    clobber the winner's newer timestamp (TOCTOU race).
+    Both writes are transactional so a crash/exception between them can't leave the
+    interval durably written with prefs.lastSleep never updated (or vice versa) - the
+    whole write either fully commits or fully fails. A failure here propagates to the
+    caller (unlike a prior best-effort try/except around only the lastSleep update),
+    so runner.py's retry logic and store.mark()-gating correctly treat a failed write
+    as "not yet written" rather than a false success.
+
+    interval_id is a deterministic hash of the SNOO session_id, so re-running this
+    transaction (e.g. Firestore's automatic contention retry, or a future pass
+    re-attempting a session whose prior write failed) overwrites it with identical
+    data - it stays idempotent.
     """
     start_sec = interval.start.timestamp()
     duration_sec = int((interval.end - interval.start).total_seconds())
@@ -56,6 +65,7 @@ async def write_sleep_interval(
     sleep_ref = client.collection("sleep").document(child_uid)
 
     interval_id = hashlib.sha256(interval.session_id.encode("utf-8")).hexdigest()[:16]
+    interval_ref = sleep_ref.collection("intervals").document(interval_id)
 
     loc_key = config.HUCKLEBERRY_SLEEP_LOCATION
     if loc_key not in config.VALID_SLEEP_LOCATIONS:
@@ -79,10 +89,47 @@ async def write_sleep_interval(
         details=details,
         lastUpdated=time.time(),
     )
+    interval_payload = to_firebase_dict(sleep_data)
+    now = time.time()
 
-    payload = to_firebase_dict(sleep_data)
+    @async_transactional
+    async def _write_txn(txn: AsyncTransaction) -> bool:
+        # Firestore transactions require every read to precede every write in the
+        # same transaction - this read must stay first, before either txn.set() call.
+        sleep_doc = await sleep_ref.get(transaction=txn)
+        existing_last_start = 0.0
+        if sleep_doc.exists:
+            prefs = (sleep_doc.to_dict() or {}).get("prefs", {})
+            existing_last_start = float((prefs.get("lastSleep") or {}).get("start") or 0)
 
-    await sleep_ref.collection("intervals").document(interval_id).set(payload)
+        # AsyncDocumentReference.set() has no `transaction` kwarg - writes inside a
+        # transaction go through the transaction object's own .set().
+        txn.set(interval_ref, interval_payload)
+
+        updated_last_sleep = False
+        if start_sec > existing_last_start:
+            last_sleep = FirebaseLastSleepData(
+                start=start_sec,
+                duration=duration_sec,
+                offset=tz_offset,
+            )
+            # merge=True creates the parent document if it doesn't exist yet,
+            # unlike a plain overwrite which requires it to already exist.
+            txn.set(
+                sleep_ref,
+                {
+                    "prefs": {
+                        "lastSleep": to_firebase_dict(last_sleep),
+                        "timestamp": {"seconds": now},
+                        "local_timestamp": now,
+                    }
+                },
+                merge=True,
+            )
+            updated_last_sleep = True
+        return updated_last_sleep
+
+    updated = await _write_txn(client.transaction())
     log.info(
         "Wrote sleep interval %s to Huckleberry (doc %s): start=%s duration=%ds",
         interval.session_id,
@@ -90,47 +137,8 @@ async def write_sleep_interval(
         interval.start.isoformat(),
         duration_sec,
     )
-
-    # Update prefs.lastSleep inside a transaction so concurrent writes can't
-    # race on the read-modify-write of the stored start timestamp. Firestore
-    # will retry the transaction on contention; best-effort: a failure here
-    # must not prevent the dedupe mark from running.
-    try:
-        now = time.time()
-        txn = client.transaction()
-
-        @async_transactional
-        async def _update_last_sleep(txn) -> None:
-            sleep_doc = await sleep_ref.get(transaction=txn)
-            existing_last_start = 0.0
-            if sleep_doc.exists:
-                prefs = (sleep_doc.to_dict() or {}).get("prefs", {})
-                existing_last_start = float((prefs.get("lastSleep") or {}).get("start") or 0)
-
-            if start_sec > existing_last_start:
-                last_sleep = FirebaseLastSleepData(
-                    start=start_sec,
-                    duration=duration_sec,
-                    offset=tz_offset,
-                )
-                # set(..., merge=True) creates the parent document if it doesn't exist yet,
-                # unlike update() which requires it to already exist.
-                await sleep_ref.set(
-                    {
-                        "prefs": {
-                            "lastSleep": to_firebase_dict(last_sleep),
-                            "timestamp": {"seconds": now},
-                            "local_timestamp": now,
-                        }
-                    },
-                    merge=True,
-                    transaction=txn,
-                )
-                log.debug("Updated prefs.lastSleep for child %s", child_uid)
-
-        await _update_last_sleep(txn)
-    except Exception:
-        log.warning("Failed to update prefs.lastSleep; interval already written, continuing.", exc_info=True)
+    if updated:
+        log.debug("Updated prefs.lastSleep for child %s", child_uid)
 
 
 async def make_huckleberry_client(
