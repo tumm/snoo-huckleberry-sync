@@ -1,6 +1,7 @@
 """Tests for the pure formatting/aggregation helpers in sync.snoo_source."""
 
 from sync.snoo_source import (
+    _total_duration_seconds,
     aggregate_segment_durations,
     fmt_dur,
     format_session_notes,
@@ -66,6 +67,30 @@ class TestAggregateSegmentDurations:
         assert asleep == 0.0
         assert soothing == 0.0
         assert other == {}
+
+
+class TestTotalDurationSeconds:
+    def test_sums_regardless_of_type_label(self):
+        # Regression test for the exact counterexample that exposed the bug: a
+        # segment with an empty/falsy `type` and a real numeric stateDuration
+        # must still count toward the total, even though
+        # aggregate_segment_durations deliberately excludes it from `other`
+        # (see test_empty_label_skipped_from_other above). Deriving the total
+        # as asleep + soothing + sum(other.values()) would silently compute
+        # 200.0 instead of 500.0 here.
+        segments = [("", 300.0), ("asleep", 200.0)]
+        assert _total_duration_seconds(segments) == 500.0
+
+    def test_matches_sum_when_no_segments_are_unlabeled(self):
+        segments = [("asleep", 300.0), ("soothing", 120.0), ("TIMEOUT", 30.0)]
+        assert _total_duration_seconds(segments) == 450.0
+
+    def test_skips_non_numeric_durations(self):
+        segments = [("asleep", 300.0), ("soothing", None)]
+        assert _total_duration_seconds(segments) == 300.0
+
+    def test_empty_list(self):
+        assert _total_duration_seconds([]) == 0.0
 
 
 class TestFormatSessionNotes:

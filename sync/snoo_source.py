@@ -104,6 +104,21 @@ def aggregate_segment_durations(
     return asleep, soothing, dict(other)
 
 
+def _total_duration_seconds(seg_pairs: list[tuple[str, float]]) -> float:
+    """Sum every segment's numeric stateDuration, regardless of its `type` label.
+
+    Deliberately independent of aggregate_segment_durations's bucketed output:
+    that helper excludes segments with an empty/unrecognized type label from its
+    `other` breakdown by design, which is correct for the notes text but would
+    silently drop that segment's duration from the session's total/end-time if
+    reused here (the missing-duration warning in fetch_past_sessions only
+    catches non-numeric durations, not empty type labels). Mirrors
+    live_source.py's _close_open_sessions, which likewise computes
+    total_seconds independently rather than from the aggregator's output.
+    """
+    return sum(dur for _, dur in seg_pairs if isinstance(dur, (int, float)))
+
+
 def fmt_dur(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
@@ -381,16 +396,16 @@ async def fetch_past_sessions(
         # Earliest start (naive local time → attach zone → convert to UTC)
         start_dt_utc = min(start_times).replace(tzinfo=tz).astimezone(UTC)
 
-        # Aggregate durations once via the shared helper. `total` is the sum of
-        # every numeric segment duration; segments with missing/non-numeric
-        # stateDuration are silently skipped by aggregate_segment_durations, so
-        # if any are encountered the computed end time will be a lower bound.
+        # total_duration is summed independently of the notes aggregator - see
+        # _total_duration_seconds's docstring for why deriving it from
+        # aggregate_segment_durations's output would silently drop segments with
+        # an empty `type` label.
         seg_pairs = [(seg.get("type", ""), seg.get("stateDuration")) for seg in segments]
+        total_duration = _total_duration_seconds(seg_pairs)
         asleep_duration, soothing_duration, other_states = aggregate_segment_durations(seg_pairs)
-        total_duration = asleep_duration + soothing_duration + sum(other_states.values())
 
         # Warn if any segment had a non-numeric duration - the end time derived
-        # from total_duration would then be a lower bound (see aggregate_segment_durations).
+        # from total_duration would then be a lower bound (see _total_duration_seconds).
         missing_dur = sum(
             1 for _, d in seg_pairs if not isinstance(d, (int, float))
         )
