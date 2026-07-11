@@ -160,23 +160,20 @@ class LiveSessionTracker:
                 datetime.fromtimestamp(start_ms / 1000, tz=UTC).isoformat(),
             )
         else:
-            # Dedupe: after a reconnect python-snoo may re-deliver the last
-            # event we already persisted. Appending it again would create a
-            # zero-duration duplicate segment and inflate the segment list.
-            # The seed event uses back-computed start_ms (not data.event_time_ms),
-            # so check both candidates against the stored rows.
-            existing_keys = set(existing)
-            is_seed_dup = (
-                (data.event_time_ms, state) in existing_keys
-                or (
-                    data.state_machine.since_session_start_ms is not None
-                    and data.state_machine.since_session_start_ms >= 0
-                    and (back_compute_start_ms(
-                        data.event_time_ms, data.state_machine.since_session_start_ms
-                    ), state) in existing_keys
-                )
-            )
-            if is_seed_dup:
+            # Dedupe: after a reconnect python-snoo may re-deliver an event we
+            # already recorded. Only compare against the single MOST RECENTLY
+            # stored row - never a back-computed key searched across the whole
+            # history. Back-computing the incoming event's start_ms and matching
+            # it against every stored row is WRONG: since_session_start_ms is
+            # always relative to the session's TRUE start, so ANY later event
+            # that returns to the seed state (e.g. BASELINE) back-computes to
+            # the exact same (start_ms, state) key as the seed row and would be
+            # wrongly dropped as a "duplicate" - merging consecutive soothing
+            # episodes and corrupting the asleep/soothing breakdown. Comparing
+            # only against existing[-1]'s raw (event_time_ms, state) catches
+            # true immediate redelivery without that collision.
+            last_event_time_ms, last_state = existing[-1]
+            if data.event_time_ms == last_event_time_ms and state == last_state:
                 log.debug("Live event for session %s already recorded - dropping duplicate.", session_id)
                 return []
             self._store.append_live_event(session_id, data.event_time_ms, state)

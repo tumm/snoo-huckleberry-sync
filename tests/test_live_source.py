@@ -190,6 +190,64 @@ class TestLiveSessionTrackerHandleEvent:
         events = store.get_live_events("abc")
         assert len(events) == 1  # no duplicate
 
+    def test_return_to_seed_state_not_dropped_as_duplicate(self, tracker, store):
+        """Regression test for a false-positive dedupe bug: a legitimate LATER
+        return to the session's seed state (e.g. BASELINE -> LEVEL1 -> BASELINE)
+        must not be dropped just because it back-computes to the same
+        (start_ms, state) key as the seed row. since_session_start_ms is always
+        relative to the TRUE session start, so this back-computed key collision
+        is unavoidable for any return to the seed state - the fix must not rely
+        on back-computation at all."""
+        seed = make_event(
+            session_id="abc", state="BASELINE",
+            event_time_ms=1_000_000, since_session_start_ms=0,
+        )
+        tracker.handle_event(seed)  # stored row: (1_000_000, "BASELINE")
+
+        soothing = make_event(
+            session_id="abc", state="LEVEL1",
+            event_time_ms=1_060_000, since_session_start_ms=60_000,
+        )
+        tracker.handle_event(soothing)
+
+        # Real, later return to BASELINE. back_compute_start_ms(1_120_000, 120_000)
+        # == 1_000_000 - identical to the seed row's key under the old buggy
+        # logic - but this is a genuine new transition and must be recorded.
+        back_to_baseline = make_event(
+            session_id="abc", state="BASELINE",
+            event_time_ms=1_120_000, since_session_start_ms=120_000,
+        )
+        result = tracker.handle_event(back_to_baseline)
+
+        assert result == []
+        events = store.get_live_events("abc")
+        assert events == [
+            (1_000_000, "BASELINE"),
+            (1_060_000, "LEVEL1"),
+            (1_120_000, "BASELINE"),
+        ]
+
+    def test_redelivery_of_latest_non_seed_event_dropped(self, tracker, store):
+        """True immediate redelivery (the exact same raw event arriving twice in
+        a row) is still dropped, even when it's not the seed event."""
+        seed = make_event(
+            session_id="abc", state="BASELINE",
+            event_time_ms=1_000_000, since_session_start_ms=0,
+        )
+        tracker.handle_event(seed)
+        soothing = make_event(
+            session_id="abc", state="LEVEL1",
+            event_time_ms=1_060_000, since_session_start_ms=60_000,
+        )
+        tracker.handle_event(soothing)
+
+        # Reconnect re-delivers the same LEVEL1 event
+        result = tracker.handle_event(soothing)
+
+        assert result == []
+        events = store.get_live_events("abc")
+        assert events == [(1_000_000, "BASELINE"), (1_060_000, "LEVEL1")]
+
     def test_session_id_zero_closes_open_sessions(self, tracker, store):
         seed = make_event(
             session_id="abc",
