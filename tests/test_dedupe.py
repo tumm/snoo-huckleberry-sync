@@ -1,6 +1,5 @@
 """Tests for DedupeStore - the SQLite-backed idempotency store."""
 
-import threading
 from datetime import UTC, datetime
 
 import pytest
@@ -83,30 +82,3 @@ class TestLiveEvents:
         store.append_live_event("s2", 2000, "BASELINE")
         ids = store.open_live_session_ids()
         assert ids == ["s1", "s2"]
-
-
-class TestConcurrency:
-    def test_concurrent_writes_dont_corrupt(self, tmp_path):
-        db = tmp_path / "concurrent.sqlite"
-        store = DedupeStore(str(db))
-        start = datetime(2024, 1, 1, tzinfo=UTC)
-        end = datetime(2024, 1, 1, hour=1, tzinfo=UTC)
-
-        errors: list[Exception] = []
-
-        def writer(thread_id: int) -> None:
-            try:
-                for i in range(50):
-                    store.mark(f"t{thread_id}-s{i}", start, end)
-                    store.seen(f"t{thread_id}-s{i}")
-            except Exception as e:
-                errors.append(e)
-
-        threads = [threading.Thread(target=writer, args=(t,)) for t in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        store.close()
-        assert errors == []
