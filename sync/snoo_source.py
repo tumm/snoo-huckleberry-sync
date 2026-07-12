@@ -1,15 +1,18 @@
 """SNOO data source: fetch completed sleep sessions from history API."""
 
+import asyncio
 import logging
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Callable
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import aiohttp
-from python_snoo.snoo import Snoo
 from python_snoo.containers import SnooData, SnooDevice
+from python_snoo.snoo import Snoo
+
+from .models import SnooCompletedSession
 
 log = logging.getLogger(__name__)
 
@@ -17,14 +20,20 @@ BABIES_URL = "https://api-us-east-1-prod.happiestbaby.com/us/me/v10/babies"
 SLEEP_URL = "https://api-us-east-1-prod.happiestbaby.com/ss/me/v11/babies/{baby_id}/sessions/daily"
 DEVICES_URL = "https://api-us-east-1-prod.happiestbaby.com/hds/me/v11/devices"
 
+# SNOO's "daily" sessions endpoint groups sessions starting at 6:00 AM local time.
+_DAILY_WINDOW_START_HOUR = 6
 
-@dataclass
-class SnooCompletedSession:
-    session_id: str
-    start: datetime  # aware datetime in UTC
-    end: datetime    # aware datetime in UTC
-    total_seconds: float
-    notes: str
+_START_TIME_FORMATS = ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S")
+
+
+def _parse_start_time(raw: str) -> datetime | None:
+    """Parse a SNOO startTime string, tolerating with/without fractional seconds."""
+    for fmt in _START_TIME_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 @dataclass
@@ -48,11 +57,11 @@ class SnooDeviceState:
         ms = self.session_start_ms
         if ms is None:
             return None
-        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        return datetime.fromtimestamp(ms / 1000, tz=UTC)
 
     @property
     def event_time(self) -> datetime:
-        return datetime.fromtimestamp(self.event_time_ms / 1000, tz=timezone.utc)
+        return datetime.fromtimestamp(self.event_time_ms / 1000, tz=UTC)
 
 
 def back_compute_start_ms(event_time_ms: int, since_session_start_ms: int | None) -> int | None:
@@ -93,6 +102,21 @@ def aggregate_segment_durations(
         elif seg_type:
             other[seg_type] += dur
     return asleep, soothing, dict(other)
+
+
+def _total_duration_seconds(seg_pairs: list[tuple[str, float]]) -> float:
+    """Sum every segment's numeric stateDuration, regardless of its `type` label.
+
+    Deliberately independent of aggregate_segment_durations's bucketed output:
+    that helper excludes segments with an empty/unrecognized type label from its
+    `other` breakdown by design, which is correct for the notes text but would
+    silently drop that segment's duration from the session's total/end-time if
+    reused here (the missing-duration warning in fetch_past_sessions only
+    catches non-numeric durations, not empty type labels). Mirrors
+    live_source.py's _close_open_sessions, which likewise computes
+    total_seconds independently rather than from the aggregator's output.
+    """
+    return sum(dur for _, dur in seg_pairs if isinstance(dur, (int, float)))
 
 
 def fmt_dur(seconds: float) -> str:
@@ -258,6 +282,23 @@ async def start_live_subscription(
     return snoo, device
 
 
+def get_subscription_task(snoo: Snoo, device: SnooDevice) -> asyncio.Task | None:
+    """Return the live MQTT subscription task for `device`, or None if none exists.
+
+    Wraps python-snoo's private `_mqtt_tasks` map so callers (the runner's
+    heartbeat watchdog) don't reach into the library's internals directly."""
+    return snoo._mqtt_tasks.get(device.serialNumber)
+
+
+def resubscribe(snoo: Snoo, device: SnooDevice, on_message: Callable[[SnooData], None]) -> None:
+    """Restart the live MQTT subscription for `device`.
+
+    `start_subscribe` is synchronous in python-snoo - it schedules an internal
+    `asyncio.create_task(subscribe_mqtt(...))` and returns. Wrapped here so the
+    private-method access lives in one place (see get_subscription_task)."""
+    snoo.start_subscribe(device, on_message)
+
+
 async def fetch_past_sessions(
     websession: aiohttp.ClientSession,
     username: str,
@@ -288,7 +329,9 @@ async def fetch_past_sessions(
     # 2. Compute date range starting at 6:00 AM in local timezone (standard daily window start)
     tz = ZoneInfo(timezone_str)
     now_local = datetime.now(tz)
-    start_date = (now_local - timedelta(days=days)).replace(hour=6, minute=0, second=0, microsecond=0)
+    start_date = (now_local - timedelta(days=days)).replace(
+        hour=_DAILY_WINDOW_START_HOUR, minute=0, second=0, microsecond=0
+    )
 
     # 3. Fetch sleep sessions from daily endpoint day-by-day
     all_entries = []
@@ -302,7 +345,7 @@ async def fetch_past_sessions(
             "startTime": start_time_str,
             "timezone": timezone_str,
         }
-        
+
         log.debug("Fetching SNOO history starting at %s", start_time_str)
         async with websession.get(SLEEP_URL.format(baby_id=baby_id), headers=hdrs, params=params) as r:
             r.raise_for_status()
@@ -338,44 +381,42 @@ async def fetch_past_sessions(
         except Exception:
             log.warning("Failed to sort segments for session %s", session_id, exc_info=True)
 
-        start_times = []
+        start_times: list[datetime] = []
         for seg in segments:
             st = seg.get("startTime")
-            if st:
-                try:
-                    parsed = datetime.strptime(st, "%Y-%m-%d %H:%M:%S.%f")
-                except Exception:
-                    try:
-                        parsed = datetime.strptime(st, "%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        continue
-                start_times.append((parsed, st))
+            if not st:
+                continue
+            parsed = _parse_start_time(st)
+            if parsed is not None:
+                start_times.append(parsed)
 
         if not start_times:
             continue
 
-        # Earliest start
-        earliest_local_dt, _ = min(start_times)
-        start_dt_utc = earliest_local_dt.replace(tzinfo=tz).astimezone(timezone.utc)
+        # Earliest start (naive local time → attach zone → convert to UTC)
+        start_dt_utc = min(start_times).replace(tzinfo=tz).astimezone(UTC)
 
-        total_duration = 0.0
-        soothing_duration = 0.0
-        asleep_duration = 0.0
-        for seg in segments:
-            dur = seg.get("stateDuration")
-            if isinstance(dur, (int, float)):
-                total_duration += dur
-                seg_type = seg.get("type", "").lower()
-                if "soothing" in seg_type:
-                    soothing_duration += dur
-                elif "asleep" in seg_type:
-                    asleep_duration += dur
+        # total_duration is summed independently of the notes aggregator - see
+        # _total_duration_seconds's docstring for why deriving it from
+        # aggregate_segment_durations's output would silently drop segments with
+        # an empty `type` label.
+        seg_pairs = [(seg.get("type", ""), seg.get("stateDuration")) for seg in segments]
+        total_duration = _total_duration_seconds(seg_pairs)
+        asleep_duration, soothing_duration, other_states = aggregate_segment_durations(seg_pairs)
+
+        # Warn if any segment had a non-numeric duration - the end time derived
+        # from total_duration would then be a lower bound (see _total_duration_seconds).
+        missing_dur = sum(
+            1 for _, d in seg_pairs if not isinstance(d, (int, float))
+        )
+        if missing_dur:
+            log.warning(
+                "Session %s has %d segment(s) with non-numeric stateDuration; "
+                "computed end time may be understated.",
+                session_id, missing_dur,
+            )
 
         end_dt_utc = start_dt_utc + timedelta(seconds=total_duration)
-
-        _, _, other_states = aggregate_segment_durations(
-            [(seg.get("type", ""), seg.get("stateDuration")) for seg in segments]
-        )
         notes = format_session_notes(asleep_duration, soothing_duration, other_states)
 
         completed_sessions.append(SnooCompletedSession(

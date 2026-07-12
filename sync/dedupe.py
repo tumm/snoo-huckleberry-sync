@@ -3,11 +3,19 @@
 written_sessions    - sessions already synced to Huckleberry (permanent).
 active_sessions     - sessions currently in progress on the SNOO (transient; basic mode only).
 live_session_events - per-state-transition event log for in-progress sessions (transient; live mode only).
+
+Not thread-safe by design: python-snoo's live subscription delivers events via
+`async for message in client.messages` inside a task scheduled with
+asyncio.create_task - there is no separate MQTT callback thread. Everything in
+this process runs on the single asyncio event-loop OS thread, and no method
+here contains an `await`, so none can be interleaved mid-call by the event
+loop either. A threading.Lock would protect against a race that cannot occur
+in this codebase's architecture.
 """
 
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -53,7 +61,7 @@ class DedupeStore:
         return cur.fetchone() is not None
 
     def mark(self, session_id: str, start: datetime, end: datetime) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         self._conn.execute(
             "INSERT OR IGNORE INTO written_sessions (session_id, start_utc, end_utc, written_at) "
             "VALUES (?, ?, ?, ?)",
@@ -70,7 +78,7 @@ class DedupeStore:
         return cur.fetchall()
 
     def record_active_session(self, session_id: str, start_ms: int, last_event_ms: int) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         self._conn.execute(
             "INSERT OR IGNORE INTO active_sessions (session_id, start_ms, last_event_ms, first_seen) "
             "VALUES (?, ?, ?, ?)",
