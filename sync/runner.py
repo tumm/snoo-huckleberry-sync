@@ -315,10 +315,12 @@ async def _write_one_live_session(
     # This runs as a fire-and-forget asyncio.create_task from on_message, with no
     # caller left to see an exception - by the time this session reaches here its
     # source events are already cleared from SQLite (LiveSessionTracker's job is
-    # done), so a failure here means the reconstructed session data is gone for
-    # good unless it's at least logged loudly for a human to notice and recover
-    # manually (e.g. from these log lines) rather than vanishing into asyncio's
-    # generic "Task exception was never retrieved" warning.
+    # done), so on final failure the reconstructed session is saved to the
+    # failed_writes outbox and retried on the heartbeat. The in-flight backoff
+    # stays short (seconds, not minutes) on purpose: shutdown drains write tasks
+    # with a 30s budget, and an outage that outlasts the backoff - e.g. Google's
+    # securetoken endpoint 429-throttling Huckleberry's shared Firebase API key
+    # for minutes - is exactly what the outbox is for.
     try:
         await _retry_with_backoff(
             _do_write,
@@ -328,9 +330,12 @@ async def _write_one_live_session(
             on_retry=_log_retry,
         )
     except Exception:
+        store.save_failed_write(
+            sess.session_id, sess.start, sess.end, sess.total_seconds, sess.notes
+        )
         log.error(
-            "Failed to write live session %s to Huckleberry after %d attempts - this "
-            "session's data is now lost (source events already cleared). "
+            "Failed to write live session %s to Huckleberry after %d attempts - queued "
+            "in the failed-write outbox for retry on the next heartbeat. "
             "start=%s end=%s notes:\n%s",
             sess.session_id,
             _MAX_WRITE_ATTEMPTS,
@@ -339,6 +344,42 @@ async def _write_one_live_session(
             sess.notes,
             exc_info=True,
         )
+
+
+async def _retry_failed_writes(store: DedupeStore, hb, child_uid: str | None) -> None:
+    """Drain the failed-write outbox: one write attempt per queued session.
+
+    Anything that fails again stays queued for the next heartbeat, so there is
+    no backoff here - the heartbeat interval IS the backoff. The deterministic
+    Firestore doc ID makes a rare double-write (e.g. a prior attempt that
+    committed but crashed before store.mark) overwrite the same document."""
+    pending = store.get_failed_writes()
+    if not pending:
+        return
+    log.info("Retrying %d session(s) from the failed-write outbox.", len(pending))
+    for session_id, start_utc, end_utc, total_seconds, notes in pending:
+        if store.seen(session_id):
+            store.delete_failed_write(session_id)
+            continue
+        sess = SnooCompletedSession(
+            session_id=session_id,
+            start=datetime.fromisoformat(start_utc),
+            end=datetime.fromisoformat(end_utc),
+            total_seconds=total_seconds,
+            notes=notes,
+        )
+        try:
+            await write_sleep_interval(hb, child_uid, sess)
+        except Exception:
+            log.warning(
+                "Outbox retry for live session %s failed - still queued for the next heartbeat.",
+                session_id,
+                exc_info=True,
+            )
+            continue
+        store.mark(sess.session_id, sess.start, sess.end)
+        store.delete_failed_write(session_id)
+        log.info("Queued live session %s written to Huckleberry.", session_id)
 
 
 async def _run_live() -> None:
@@ -371,6 +412,12 @@ async def _run_live_loop(store: DedupeStore, dry: bool) -> None:
                 session, config.HUCKLEBERRY_EMAIL, config.HUCKLEBERRY_PASSWORD, config.HUCKLEBERRY_TIMEZONE,
             )
             child_uid = await resolve_child_uid(hb, config.HUCKLEBERRY_CHILD_UID)
+            # Flush anything a previous run left in the failed-write outbox
+            # (e.g. the process was restarted while Huckleberry was unreachable).
+            try:
+                await _retry_failed_writes(store, hb, child_uid)
+            except Exception:
+                log.error("Startup failed-write outbox pass failed.", exc_info=True)
 
         # Strong references to fire-and-forget write tasks - asyncio.Task only
         # holds a weak reference internally, so without this a task can be
@@ -437,6 +484,12 @@ async def _run_live_loop(store: DedupeStore, dry: bool) -> None:
                     )
             else:
                 log.info("Live mode heartbeat: MQTT subscription alive for %s.", device.serialNumber)
+
+            if not dry:
+                try:
+                    await _retry_failed_writes(store, hb, child_uid)
+                except Exception:
+                    log.error("Heartbeat failed-write outbox pass failed.", exc_info=True)
 
         # Graceful shutdown: drain in-flight write tasks so a SIGTERM during a
         # write doesn't lose the session. Best-effort with a bounded wait so a

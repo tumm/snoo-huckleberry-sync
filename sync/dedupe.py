@@ -3,6 +3,7 @@
 written_sessions    - sessions already synced to Huckleberry (permanent).
 active_sessions     - sessions currently in progress on the SNOO (transient; basic mode only).
 live_session_events - per-state-transition event log for in-progress sessions (transient; live mode only).
+failed_writes       - completed sessions whose Huckleberry write failed, kept for retry (transient; live mode only).
 
 Not thread-safe by design: python-snoo's live subscription delivers events via
 `async for message in client.messages` inside a task scheduled with
@@ -40,6 +41,14 @@ CREATE TABLE IF NOT EXISTS live_session_events (
     state         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_live_session_events_session_id ON live_session_events(session_id);
+CREATE TABLE IF NOT EXISTS failed_writes (
+    session_id    TEXT PRIMARY KEY,
+    start_utc     TEXT NOT NULL,
+    end_utc       TEXT NOT NULL,
+    total_seconds REAL NOT NULL,
+    notes         TEXT NOT NULL,
+    failed_at     TEXT NOT NULL
+);
 """
 
 
@@ -101,6 +110,32 @@ class DedupeStore:
         )
         self._conn.commit()
         log.debug("Closed active session %s", session_id)
+
+    # ---- failed-write outbox (live mode) ----
+
+    def save_failed_write(
+        self, session_id: str, start: datetime, end: datetime, total_seconds: float, notes: str
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            "INSERT OR IGNORE INTO failed_writes "
+            "(session_id, start_utc, end_utc, total_seconds, notes, failed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, start.isoformat(), end.isoformat(), total_seconds, notes, now),
+        )
+        self._conn.commit()
+
+    def get_failed_writes(self) -> list[tuple[str, str, str, float, str]]:
+        """Return (session_id, start_utc, end_utc, total_seconds, notes) rows, oldest failure first."""
+        cur = self._conn.execute(
+            "SELECT session_id, start_utc, end_utc, total_seconds, notes "
+            "FROM failed_writes ORDER BY rowid ASC"
+        )
+        return cur.fetchall()
+
+    def delete_failed_write(self, session_id: str) -> None:
+        self._conn.execute("DELETE FROM failed_writes WHERE session_id = ?", (session_id,))
+        self._conn.commit()
 
     # ---- live session event tracking (live MQTT mode) ----
 

@@ -58,6 +58,41 @@ class TestActiveSessions:
         assert active[0] == ("s1", 1000, 2000)  # original kept
 
 
+class TestFailedWrites:
+    def test_empty_by_default(self, store):
+        assert store.get_failed_writes() == []
+
+    def test_save_and_get_round_trip(self, store):
+        start = datetime(2026, 7, 14, 21, 53, 12, tzinfo=UTC)
+        end = datetime(2026, 7, 15, 0, 18, 26, tzinfo=UTC)
+        store.save_failed_write("s1", start, end, 8714.0, "notes here")
+        rows = store.get_failed_writes()
+        assert rows == [("s1", start.isoformat(), end.isoformat(), 8714.0, "notes here")]
+
+    def test_save_is_idempotent(self, store):
+        start = datetime(2026, 7, 14, tzinfo=UTC)
+        end = datetime(2026, 7, 15, tzinfo=UTC)
+        store.save_failed_write("s1", start, end, 100.0, "first")
+        store.save_failed_write("s1", start, end, 100.0, "second")  # should not raise
+        rows = store.get_failed_writes()
+        assert len(rows) == 1
+        assert rows[0][4] == "first"  # original kept
+
+    def test_get_returns_oldest_first(self, store):
+        start = datetime(2026, 7, 14, tzinfo=UTC)
+        end = datetime(2026, 7, 15, tzinfo=UTC)
+        store.save_failed_write("s2", start, end, 100.0, "")
+        store.save_failed_write("s1", start, end, 100.0, "")
+        assert [r[0] for r in store.get_failed_writes()] == ["s2", "s1"]
+
+    def test_delete_removes(self, store):
+        start = datetime(2026, 7, 14, tzinfo=UTC)
+        end = datetime(2026, 7, 15, tzinfo=UTC)
+        store.save_failed_write("s1", start, end, 100.0, "")
+        store.delete_failed_write("s1")
+        assert store.get_failed_writes() == []
+
+
 class TestLiveEvents:
     def test_append_and_get(self, store):
         store.append_live_event("s1", 1000, "BASELINE")
