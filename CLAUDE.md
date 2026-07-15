@@ -29,7 +29,7 @@ docker build -t snoo-huckleberry-sync .      # build image
 | `sync/config.py` | Loads all env vars at import time; raises on missing required vars |
 | `sync/ssl_helper.py` | Automatically exports Windows root certificates to PEM for gRPC and provides custom SSL Context |
 | `sync/snoo_source.py` | Authenticates with `python-snoo`; `fetch_past_sessions` (premium), `fetch_device_state` (basic polling), `start_live_subscription` (live MQTT push); shared `aggregate_segment_durations`/`format_session_notes` helpers |
-| `sync/dedupe.py` | SQLite store with three tables: `written_sessions` (permanent seen-cache), `active_sessions` (transient, basic-mode in-progress tracking), `live_session_events` (transient, live-mode per-transition event log) |
+| `sync/dedupe.py` | SQLite store with four tables: `written_sessions` (permanent seen-cache), `active_sessions` (transient, basic-mode in-progress tracking), `live_session_events` (transient, live-mode per-transition event log), `failed_writes` (transient, live-mode outbox for sessions whose Huckleberry write failed; retried at startup and on every heartbeat) |
 | `sync/live_source.py` | `LiveSessionTracker` - pure session-reconstruction logic from live MQTT events, no network/Firestore I/O |
 | `sync/huckleberry_sink.py` | Authenticates with `huckleberry-api`, writes sleep intervals with details and location to Firestore and updates `prefs.lastSleep` |
 | `sync/runner.py` | Orchestrates one pass or a timed loop; branches into `_run_live`, `_run_once_basic`, or `_run_once_premium` per `SNOO_MODE` |
