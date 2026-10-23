@@ -340,3 +340,30 @@ class TestLiveSessionTrackerDetailed:
         notes = result[0].notes
         assert "Asleep:" in notes
         assert "Soothing:" in notes
+
+
+class TestInvalidLiveTimestamps:
+    @pytest.mark.parametrize('bad_time', [0, -1, 900_000, 1_030_000])
+    def test_bad_close_preserves_events_until_valid_close(self, tracker, store, bad_time):
+        tracker.handle_event(make_event(session_id='abc', event_time_ms=1_000_000))
+        tracker.handle_event(make_event(session_id='abc', state='LEVEL1', event_time_ms=1_060_000))
+        before = store.get_live_events('abc')
+        assert tracker.handle_event(make_event(session_id='0', state='ONLINE', event_time_ms=bad_time)) == []
+        assert store.get_live_events('abc') == before
+        # Recreate the tracker to exercise persisted recovery across a restart.
+        restarted = LiveSessionTracker(store, min_session_seconds=60, notes_detail='summary')
+        result = restarted.handle_event(make_event(session_id='0', state='ONLINE', event_time_ms=1_300_000))
+        assert len(result) == 1
+        assert result[0].total_seconds == 300
+        assert store.get_live_events('abc') == []
+
+    @pytest.mark.parametrize('bad_time', [0, -1, 900_000])
+    def test_invalid_active_event_does_not_corrupt_segments(self, tracker, store, bad_time):
+        tracker.handle_event(make_event(session_id='abc', event_time_ms=1_000_000))
+        tracker.handle_event(make_event(session_id='abc', state='LEVEL1', event_time_ms=bad_time))
+        assert store.get_live_events('abc') == [(1_000_000, 'BASELINE')]
+
+    @pytest.mark.parametrize('event_time,elapsed', [(0, 0), (-1, 0), (1_000_000, 2_000_000)])
+    def test_invalid_seed_does_not_create_session(self, tracker, store, event_time, elapsed):
+        tracker.handle_event(make_event(session_id='abc', event_time_ms=event_time, since_session_start_ms=elapsed))
+        assert store.open_live_session_ids() == []

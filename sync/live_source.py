@@ -134,6 +134,9 @@ class LiveSessionTracker:
         self._notes_detail = notes_detail
 
     def handle_event(self, data: SnooData) -> list[SnooCompletedSession]:
+        if data.event_time_ms <= 0:
+            log.warning("Ignoring live event with invalid timestamp %s; retaining session events.", data.event_time_ms)
+            return []
         session_id = str(data.state_machine.session_id)
         if session_id in ("0", ""):
             return self._close_open_sessions(data)
@@ -153,6 +156,9 @@ class LiveSessionTracker:
             )
             if start_ms is None:
                 start_ms = data.event_time_ms
+            if start_ms <= 0:
+                log.warning("Ignoring invalid start timestamp %s for session %s.", start_ms, session_id)
+                return []
             self._store.append_live_event(session_id, start_ms, state)
             log.info(
                 "Tracking new live SNOO session %s (started %s)",
@@ -173,6 +179,9 @@ class LiveSessionTracker:
             # only against existing[-1]'s raw (event_time_ms, state) catches
             # true immediate redelivery without that collision.
             last_event_time_ms, last_state = existing[-1]
+            if data.event_time_ms < last_event_time_ms:
+                log.warning("Ignoring out-of-order live event for session %s.", session_id)
+                return []
             if data.event_time_ms == last_event_time_ms and state == last_state:
                 log.debug("Live event for session %s already recorded - dropping duplicate.", session_id)
                 return []
@@ -184,10 +193,14 @@ class LiveSessionTracker:
         open_ids = self._store.open_live_session_ids()
         for i, session_id in enumerate(open_ids):
             events = self._store.get_live_events(session_id)
-            self._store.clear_live_events(session_id)
 
             if not events:
                 log.warning("Live session %s had no recorded events, discarding.", session_id)
+                continue
+
+            # A delayed/invalid close must not erase the only persisted session copy.
+            if closing_data.event_time_ms < max(t for t, _ in events):
+                log.warning("Ignoring stale closing timestamp for session %s; retaining session events.", session_id)
                 continue
 
             start_ms = events[0][0]
@@ -217,6 +230,7 @@ class LiveSessionTracker:
             total_seconds = (end_ms - start_ms) / 1000
             if total_seconds < self._min_session_seconds:
                 log.info("Live session %s too short (%.0fs) - discarding.", session_id, total_seconds)
+                self._store.clear_live_events(session_id)
                 continue
 
             segments: list[tuple[str, float]] = []
@@ -254,4 +268,5 @@ class LiveSessionTracker:
                 total_seconds=total_seconds,
                 notes=notes,
             ))
+            self._store.clear_live_events(session_id)
         return completed
